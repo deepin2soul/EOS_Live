@@ -67,6 +67,13 @@ class MainActivity : Activity() {
          * выше, чем шире — увеличь. Действует и на превью, и на запись.
          */
         const val X5_STRETCH = 1.0f
+
+        /**
+         * Как класть в видео кадр другого размера (например ×5 при записи, начатой на ×1).
+         * true  — заполнить весь кадр видео: лишнее сверху и снизу обрезается, чёрных полей нет;
+         * false — вписать целиком: сверху/снизу или по бокам остаются чёрные поля.
+         */
+        const val ZOOM_FILL_FRAME = true
     }
 
     private lateinit var usb: UsbManager
@@ -768,7 +775,9 @@ class MainActivity : Activity() {
         val a = if (aspect > 0f) aspect else src.width.toFloat() / src.height
         val dw: Float
         val dh: Float
-        if (a >= tw.toFloat() / th) { dw = tw.toFloat(); dh = tw / a } else { dh = th.toFloat(); dw = th * a }
+        // fit: целиком с полями; fill: на весь холст с обрезкой лишнего по центру
+        val wider = a >= tw.toFloat() / th
+        if (wider != ZOOM_FILL_FRAME) { dw = tw.toFloat(); dh = tw / a } else { dh = th.toFloat(); dw = th * a }
         val out = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
         val c = Canvas(out)
         c.drawColor(Color.BLACK)

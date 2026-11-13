@@ -1,5 +1,6 @@
 package com.example.eoslive
 
+import android.Manifest
 import android.app.Activity
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
@@ -10,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
@@ -68,6 +70,9 @@ class MainActivity : Activity() {
 
     @Volatile private var running = false
     @Volatile private var recording = false
+    private var mic: MicCapture? = null
+    private var decAcc = 0L // замеры декодирования JPEG (только поток камеры)
+    private var decN = 0
     private val uiBusy = AtomicBoolean(false)
     private val logBuf = StringBuilder()
 
@@ -400,6 +405,11 @@ class MainActivity : Activity() {
     }
 
     private fun onRecClick() {
+        if (!recording && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 77)
+            Toast.makeText(this, "Разреши микрофон и нажми запись ещё раз", Toast.LENGTH_LONG).show()
+            return
+        }
         recording = !recording
         setRecUi()
     }
@@ -492,6 +502,14 @@ class MainActivity : Activity() {
             var lastEvT = startT
             var keepT = startT
 
+            // --- замеры: где уходит время (окно 5 с) ---
+            var stT = startT
+            var stGetOk = 0L; var stGetOkN = 0; var stBytes = 0L
+            var stGetEmpty = 0L; var stEmptyN = 0
+            var stHandle = 0L; var stEvents = 0L; var stSleep = 0L
+            var lastFrameT = 0L; var stMaxGap = 0L
+            decAcc = 0L; decN = 0
+
             while (running) {
                 // команды из интерфейса (ползунки, зум камеры)
                 var didCmd = false
@@ -502,7 +520,9 @@ class MainActivity : Activity() {
                 }
                 if (didCmd) { pollEvents(p); lastEvT = System.nanoTime() }
 
+                val tGet0 = System.nanoTime()
                 val r = p.getViewfinder()
+                val dtGet = System.nanoTime() - tGet0
                 if (r == null) {
                     noReply++
                     val still = usb.deviceList.values.any { it.vendorId == CANON_VID }
@@ -516,6 +536,7 @@ class MainActivity : Activity() {
                 val data = r.data
                 if (r.code == 0x2001 && data != null && data.isNotEmpty()) {
                     notOk = 0
+                    stGetOk += dtGet; stGetOkN++; stBytes += data.size
                     if (!firstLogged) {
                         firstLogged = true
                         val head = data.take(16).joinToString(" ") { "%02X".format(it) }
@@ -527,10 +548,15 @@ class MainActivity : Activity() {
                     } else {
                         okFrames++
                         secFrames++
+                        val tH = System.nanoTime()
                         handleFrame(jpg, data)
+                        stHandle += System.nanoTime() - tH
+                        if (lastFrameT != 0L) stMaxGap = maxOf(stMaxGap, tH - lastFrameT)
+                        lastFrameT = tH
                     }
                 } else {
                     notOk++
+                    stGetEmpty += dtGet; stEmptyN++
                     if (okFrames == 0L) {
                         // до первого кадра: логируем и ждём до ~15 с, сливая события
                         if (notOk <= 3 || notOk % 20 == 0) log("GetViewFinderData -> 0x%04X (подряд: $notOk)".format(r.code))
@@ -541,12 +567,16 @@ class MainActivity : Activity() {
                     } else {
                         // в потоке 0xA102 — просто «нового кадра ещё нет», не шумим в логе
                         if (notOk % 200 == 0) log("0xA102 подряд: $notOk")
+                        val tS = System.nanoTime()
                         Thread.sleep(15)
+                        stSleep += System.nanoTime() - tS
                     }
                 }
                 // keep-alive (как libgphoto2), чтобы камера не уходила в автовыключение
-                if (System.nanoTime() - keepT > 3_000_000_000L) { p.transact(0x911D); keepT = System.nanoTime() }
+                val tE = System.nanoTime()
+                if (tE - keepT > 3_000_000_000L) { p.transact(0x911D); keepT = System.nanoTime() }
                 if (System.nanoTime() - lastEvT > 500_000_000L) { pollEvents(p); lastEvT = System.nanoTime() }
+                stEvents += System.nanoTime() - tE
 
                 val now = System.nanoTime()
                 if (now - secT >= 1_000_000_000L) {
@@ -554,6 +584,26 @@ class MainActivity : Activity() {
                     secFrames = 0; secT = now
                     val rec = if (writer != null) " ● идёт запись" else ""
                     runOnUiThread { status.text = "%.1f к/с, кадр %s, вид %dx%d%s".format(fps, lastFrameDims, zoomView.width, zoomView.height, rec) }
+                }
+                if (now - stT >= 5_000_000_000L) {
+                    val win = (now - stT) / 1e9
+                    fun ms(ns: Long, n: Int) = if (n > 0) ns / 1e6 / n else 0.0
+                    val kb = if (stGetOkN > 0) stBytes / 1024.0 / stGetOkN else 0.0
+                    val mbs = stBytes / 1e6 / win
+                    log("замер за %.1f с: кадров %d (%.1f к/с), пауза между кадрами макс. %.0f мс".format(
+                        win, stGetOkN, stGetOkN / win, stMaxGap / 1e6))
+                    log("  GetViewFinderData с кадром: %.1f мс в среднем (%.0f КБ, %.2f МБ/с); пустых 0xA102: %d, по %.1f мс".format(
+                        ms(stGetOk, stGetOkN), kb, mbs, stEmptyN, ms(stGetEmpty, stEmptyN)))
+                    log("  обработка кадра: %.1f мс (из них декодирование JPEG %.1f мс ×%d); события+keep-alive: %.1f мс/с; sleep: %.0f мс/с".format(
+                        ms(stHandle, stGetOkN), if (decN > 0) decAcc / 1e6 / decN else 0.0, decN,
+                        stEvents / 1e6 / win, stSleep / 1e6 / win))
+                    val camShare = (stGetOk + stGetEmpty) / 1e9 / win * 100
+                    val appShare = (stHandle + stEvents + stSleep) / 1e9 / win * 100
+                    log("  доля времени: запросы к камере %.0f%%, обработка+события+sleep %.0f%%".format(camShare, appShare))
+                    stT = now
+                    stGetOk = 0; stGetOkN = 0; stBytes = 0; stGetEmpty = 0; stEmptyN = 0
+                    stHandle = 0; stEvents = 0; stSleep = 0; stMaxGap = 0
+                    decAcc = 0; decN = 0
                 }
             }
         } catch (e: Exception) {
@@ -584,8 +634,14 @@ class MainActivity : Activity() {
         if (recording && writer == null) {
             val f = File(cacheDir, "rec.avi")
             tmpFile = f
-            writer = MjpegAviWriter(f)
-            log("запись началась")
+            val hasMic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            val w = MjpegAviWriter(f, withAudio = hasMic)
+            writer = w
+            if (hasMic) {
+                val m = MicCapture(44100) { buf, n -> w.addAudio(buf, n) }
+                if (m.start()) mic = m else log("микрофон не открылся, запись без звука")
+            }
+            log("запись началась" + if (mic != null) " (со звуком)" else " (без звука)")
         } else if (!recording && writer != null) {
             finishRecording()
         }
@@ -601,7 +657,9 @@ class MainActivity : Activity() {
         }
 
         if (uiBusy.compareAndSet(false, true)) {
+            val tD = System.nanoTime()
             val bmp = BitmapFactory.decodeByteArray(jpg, 0, jpg.size)
+            decAcc += System.nanoTime() - tD; decN++
             val aspect = evfAspect(raw)
             runOnUiThread {
                 if (bmp != null) zoomView.setFrame(bmp, aspect)
@@ -663,6 +721,8 @@ class MainActivity : Activity() {
     private fun finishRecording() {
         val w = writer ?: return
         writer = null
+        mic?.stop()
+        mic = null
         val n = w.finish()
         val f = tmpFile ?: return
         if (n == 0) { log("запись пустая"); f.delete(); return }

@@ -9,6 +9,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ActivityInfo
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
@@ -21,18 +22,23 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.widget.Button
-import android.widget.ImageView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : Activity() {
@@ -43,12 +49,22 @@ class MainActivity : Activity() {
     }
 
     private lateinit var usb: UsbManager
-    private lateinit var img: ImageView
+    private lateinit var root: LinearLayout
+    private lateinit var topRow: LinearLayout
+    private lateinit var zoomView: ZoomView
     private lateinit var status: TextView
     private lateinit var logView: TextView
     private lateinit var scroll: ScrollView
     private lateinit var btnLive: Button
     private lateinit var btnRec: Button
+    private lateinit var btnRecOv: Button
+    private lateinit var btnFull: Button
+    private lateinit var btnCopy: Button
+    private lateinit var settingsRow: LinearLayout
+    private lateinit var sliderBox: LinearLayout
+    private lateinit var sliderLabel: TextView
+    private lateinit var seek: SeekBar
+    private lateinit var zoomRow: LinearLayout
 
     @Volatile private var running = false
     @Volatile private var recording = false
@@ -58,6 +74,22 @@ class MainActivity : Activity() {
     // трогаются только из рабочего потока
     private var writer: MjpegAviWriter? = null
     private var tmpFile: File? = null
+
+    // параметры камеры
+    private val eos = EosState()
+    private val cmdQ = ConcurrentLinkedQueue<(PtpUsb) -> Unit>()
+    private val props = listOf(
+        EosProp.TV to "Выдержка",
+        EosProp.AV to "Диафр.",
+        EosProp.ISO to "ISO",
+        EosProp.WB to "Баланс бел.",
+        EosProp.EXPCOMP to "Эксп. комп."
+    )
+    private val propBtns = LinkedHashMap<Int, Button>()
+    private var selProp = EosProp.ISO
+    private var sliderList = IntArray(0)
+    private var seeking = false
+    private var fullscreen = false
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -90,12 +122,26 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (fullscreen) setFullscreen(false) else super.onBackPressed()
+    }
+
+    private fun smallBtn(t: String, onClick: () -> Unit) = Button(this).apply {
+        text = t
+        textSize = 16f
+        minWidth = 0
+        minimumWidth = 0
+        alpha = 0.85f
+        setOnClickListener { onClick() }
+    }
+
     private fun buildUi() {
-        val root = LinearLayout(this).apply {
+        root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
         }
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        topRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btnLive = Button(this).apply {
             text = "Старт Live View"
             setOnClickListener { onLiveClick() }
@@ -105,20 +151,85 @@ class MainActivity : Activity() {
             isEnabled = false
             setOnClickListener { onRecClick() }
         }
-        row.addView(btnLive, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(btnRec, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        topRow.addView(btnLive, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        topRow.addView(btnRec, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
-        img = ImageView(this).apply {
-            setBackgroundColor(Color.BLACK)
-            scaleType = ImageView.ScaleType.FIT_CENTER
+        // картинка + кнопки поверх неё (запись и полный экран)
+        zoomView = ZoomView(this).apply { setBackgroundColor(Color.BLACK) }
+        btnRecOv = smallBtn("●") { onRecClick() }.apply { isEnabled = false }
+        btnFull = smallBtn("⛶") { setFullscreen(!fullscreen) }
+        val overlay = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btnRecOv)
+            addView(btnFull)
         }
+        val frame = FrameLayout(this).apply {
+            addView(zoomView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END))
+        }
+
         status = TextView(this).apply { text = "—" }
+
+        // кнопки параметров
+        settingsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for ((prop, name) in props) {
+            val b = Button(this).apply {
+                text = name
+                textSize = 11f
+                isAllCaps = false
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(2, 2, 2, 2)
+                setOnClickListener { selProp = prop; seeking = false; refreshSettingsUi() }
+            }
+            propBtns[prop] = b
+            settingsRow.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+
+        // ползунок выбранного параметра
+        sliderLabel = TextView(this).apply { text = "Параметры появятся после старта Live View" }
+        seek = SeekBar(this).apply {
+            isEnabled = false
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    val list = sliderList
+                    if (p in list.indices) sliderLabel.text = nameOf(selProp) + ": " + EosFmt.label(selProp, list[p])
+                }
+                override fun onStartTrackingTouch(sb: SeekBar) { seeking = true }
+                override fun onStopTrackingTouch(sb: SeekBar) {
+                    seeking = false
+                    applySlider(sb.progress)
+                }
+            })
+        }
+        sliderBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(sliderLabel)
+            addView(seek)
+        }
+
+        // зум самой камеры (5× и 10× как на корпусе)
+        zoomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(TextView(this@MainActivity).apply { text = "Зум камеры:" })
+            for (lvl in intArrayOf(1, 5, 10)) {
+                addView(Button(this@MainActivity).apply {
+                    text = "×$lvl"
+                    minWidth = 0
+                    minimumWidth = 0
+                    setOnClickListener { onCameraZoom(lvl) }
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            }
+        }
+
         logView = TextView(this).apply {
             typeface = Typeface.MONOSPACE
             textSize = 11f
         }
         scroll = ScrollView(this).apply { addView(logView) }
-        val btnCopy = Button(this).apply {
+        btnCopy = Button(this).apply {
             text = "Копировать лог"
             setOnClickListener {
                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -126,12 +237,121 @@ class MainActivity : Activity() {
                 Toast.makeText(this@MainActivity, "Лог скопирован", Toast.LENGTH_SHORT).show()
             }
         }
-        root.addView(row)
-        root.addView(img, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(topRow)
+        root.addView(frame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 3f))
         root.addView(status)
+        root.addView(settingsRow)
+        root.addView(sliderBox)
+        root.addView(zoomRow)
         root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(btnCopy)
         setContentView(root)
+        refreshSettingsUi()
+    }
+
+    private fun nameOf(prop: Int): String = props.firstOrNull { it.first == prop }?.second ?: "?"
+
+    private fun sortedList(prop: Int): IntArray {
+        val l = eos.list(prop) ?: return IntArray(0)
+        return when (prop) {
+            EosProp.EXPCOMP -> l.distinct().sortedBy { (it and 0xFF).toByte().toInt() }.toIntArray()
+            EosProp.WB -> l.distinct().toIntArray()
+            else -> l.distinct().sorted().toIntArray()
+        }
+    }
+
+    /** Обновить кнопки параметров и ползунок (только из UI-потока). */
+    private fun refreshSettingsUi() {
+        for ((prop, name) in props) {
+            val b = propBtns[prop] ?: continue
+            val v = eos.value(prop)
+            b.text = name + "\n" + (if (v == null) "—" else EosFmt.label(prop, v))
+            b.alpha = if (prop == selProp) 1f else 0.6f
+        }
+        if (seeking) return
+        val cur = eos.value(selProp)
+        val list = sortedList(selProp)
+        sliderList = list
+        if (cur == null && list.isEmpty()) {
+            seek.isEnabled = false
+            sliderLabel.text = nameOf(selProp) + ": нет данных (запусти Live View)"
+            return
+        }
+        val curLabel = if (cur == null) "—" else EosFmt.label(selProp, cur)
+        if (list.size < 2) {
+            seek.isEnabled = false
+            seek.max = 1
+            seek.progress = 0
+            sliderLabel.text = nameOf(selProp) + ": " + curLabel + " (выбора нет — смотри колесо режимов)"
+            return
+        }
+        seek.isEnabled = true
+        seek.max = list.size - 1
+        val idx = list.indexOf(cur ?: -1)
+        seek.progress = if (idx >= 0) idx else 0
+        sliderLabel.text = nameOf(selProp) + ": " + curLabel
+    }
+
+    private fun applySlider(index: Int) {
+        val list = sliderList
+        if (index !in list.indices) return
+        if (!running) {
+            Toast.makeText(this, "Сначала Старт Live View", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val prop = selProp
+        val v = list[index]
+        val nm = nameOf(prop) + "=" + EosFmt.label(prop, v)
+        cmdQ.add { p -> p.setProp(nm, prop, v) }
+    }
+
+    private fun onCameraZoom(level: Int) {
+        if (!running) {
+            Toast.makeText(this, "Сначала Старт Live View", Toast.LENGTH_SHORT).show()
+            return
+        }
+        cmdQ.add { p ->
+            val r = p.op("Зум камеры ×$level", 0x9158, intArrayOf(level))
+            if (r == null || r.code != 0x2001) {
+                runOnUiThread {
+                    Toast.makeText(this, "Камера не приняла зум (код " +
+                        (if (r == null) "нет ответа" else "0x%04X".format(r.code)) + ")", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun setFullscreen(on: Boolean) {
+        fullscreen = on
+        val vis = if (on) View.GONE else View.VISIBLE
+        topRow.visibility = vis
+        status.visibility = vis
+        settingsRow.visibility = vis
+        sliderBox.visibility = vis
+        zoomRow.visibility = vis
+        scroll.visibility = vis
+        btnCopy.visibility = vis
+        val pad = if (on) 0 else 24
+        root.setPadding(pad, pad, pad, pad)
+        btnFull.text = if (on) "✕" else "⛶"
+        requestedOrientation = if (on) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.insetsController?.let {
+                if (on) {
+                    it.hide(WindowInsets.Type.systemBars())
+                    it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                } else {
+                    it.show(WindowInsets.Type.systemBars())
+                }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = if (on)
+                View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            else View.SYSTEM_UI_FLAG_VISIBLE
+        }
     }
 
     private fun log(s: String) {
@@ -165,19 +385,45 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun setRecUi() {
+        val t = if (recording) "■ Стоп записи" else "● Запись"
+        btnRec.text = t
+        btnRecOv.text = if (recording) "■" else "●"
+    }
+
     private fun onRecClick() {
         recording = !recording
-        btnRec.text = if (recording) "■ Стоп записи" else "● Запись"
+        setRecUi()
     }
 
     private fun startWorker(dev: UsbDevice) {
         if (running) return
         running = true
+        eos.clear()
+        cmdQ.clear()
         runOnUiThread {
             btnLive.text = "Стоп Live View"
             btnRec.isEnabled = true
+            btnRecOv.isEnabled = true
+            refreshSettingsUi()
         }
         Thread { runLive(dev) }.start()
+    }
+
+    /** Прочитать события камеры и обновить параметры. */
+    private fun pollEvents(p: PtpUsb) {
+        val r = p.transact(0x9116)
+        if (r != null && eos.parse(r.data)) runOnUiThread { refreshSettingsUi() }
+    }
+
+    private fun logProps() {
+        val sb = StringBuilder("параметры:")
+        for ((prop, name) in props) {
+            val v = eos.value(prop)
+            val n = eos.list(prop)?.size ?: 0
+            sb.append(" $name=").append(if (v == null) "—" else EosFmt.label(prop, v)).append(" (вариантов: $n);")
+        }
+        log(sb.toString())
     }
 
     private fun runLive(dev: UsbDevice) {
@@ -217,12 +463,16 @@ class MainActivity : Activity() {
             p.op("OpenSession", 0x1002, intArrayOf(1))
             p.op("SetRemoteMode(1)", 0x9114, intArrayOf(1))
             p.op("SetEventMode(1)", 0x9115, intArrayOf(1))
-            p.op("GetEvent", 0x9116)
+            val ev0 = p.op("GetEvent", 0x9116)
+            eos.parse(ev0?.data)
             p.setProp("EVFMode=1", 0xD1B1, 1)
             p.setProp("EVFOutputDevice=PC", 0xD1B0, 2)
             // InitiateViewfinder (0x9151) на 40D даёт 0x2005 — не используем, как и libgphoto2.
             // Камера поднимает зеркало и стартует поток 1–3 с: сливаем события и ждём.
-            p.op("GetEvent", 0x9116)
+            val ev1 = p.op("GetEvent", 0x9116)
+            eos.parse(ev1?.data)
+            logProps()
+            runOnUiThread { refreshSettingsUi() }
 
             var noReply = 0
             var notOk = 0
@@ -232,12 +482,24 @@ class MainActivity : Activity() {
             var firstLogged = false
             val startT = System.nanoTime()
             var lastEvT = startT
+            var keepT = startT
 
             while (running) {
+                // команды из интерфейса (ползунки, зум камеры)
+                var didCmd = false
+                while (true) {
+                    val c = cmdQ.poll() ?: break
+                    c(p)
+                    didCmd = true
+                }
+                if (didCmd) { pollEvents(p); lastEvT = System.nanoTime() }
+
                 val r = p.getViewfinder()
                 if (r == null) {
                     noReply++
-                    log("нет ответа на GetViewFinderData ($noReply) — сбрасываю канал")
+                    val still = usb.deviceList.values.any { it.vendorId == CANON_VID }
+                    log("нет ответа на GetViewFinderData ($noReply), Canon в списке USB: ${if (still) "да" else "НЕТ (отключился)"}")
+                    if (!still) break
                     p.recover()
                     if (noReply >= 3) { log("камера не отвечает, стоп"); break }
                     continue
@@ -261,14 +523,22 @@ class MainActivity : Activity() {
                     }
                 } else {
                     notOk++
-                    if (notOk <= 3 || notOk % 20 == 0) log("GetViewFinderData -> 0x%04X (подряд: $notOk)".format(r.code))
-                    // 0xA102 = камера ещё не готова: ждём до ~15 с, сливая события
-                    if (notOk > 150) { log("Live View не запустился за 15 с, стоп"); break }
-                    p.transact(0x9116)
-                    lastEvT = System.nanoTime()
-                    Thread.sleep(100)
+                    if (okFrames == 0L) {
+                        // до первого кадра: логируем и ждём до ~15 с, сливая события
+                        if (notOk <= 3 || notOk % 20 == 0) log("GetViewFinderData -> 0x%04X (подряд: $notOk)".format(r.code))
+                        if (notOk > 150) { log("Live View не запустился за 15 с, стоп"); break }
+                        pollEvents(p)
+                        lastEvT = System.nanoTime()
+                        Thread.sleep(100)
+                    } else {
+                        // в потоке 0xA102 — просто «нового кадра ещё нет», не шумим в логе
+                        if (notOk % 200 == 0) log("0xA102 подряд: $notOk")
+                        Thread.sleep(15)
+                    }
                 }
-                if (System.nanoTime() - lastEvT > 500_000_000L) { p.transact(0x9116); lastEvT = System.nanoTime() }
+                // keep-alive (как libgphoto2), чтобы камера не уходила в автовыключение
+                if (System.nanoTime() - keepT > 3_000_000_000L) { p.transact(0x911D); keepT = System.nanoTime() }
+                if (System.nanoTime() - lastEvT > 500_000_000L) { pollEvents(p); lastEvT = System.nanoTime() }
 
                 val now = System.nanoTime()
                 if (now - secT >= 1_000_000_000L) {
@@ -295,8 +565,9 @@ class MainActivity : Activity() {
             log("Live View остановлен")
             runOnUiThread {
                 btnLive.text = "Старт Live View"
-                btnRec.text = "● Запись"
                 btnRec.isEnabled = false
+                btnRecOv.isEnabled = false
+                setRecUi()
             }
         }
     }
@@ -315,7 +586,7 @@ class MainActivity : Activity() {
         if (uiBusy.compareAndSet(false, true)) {
             val bmp = BitmapFactory.decodeByteArray(jpg, 0, jpg.size)
             runOnUiThread {
-                if (bmp != null) img.setImageBitmap(bmp)
+                if (bmp != null) zoomView.setFrame(bmp)
                 uiBusy.set(false)
             }
         }

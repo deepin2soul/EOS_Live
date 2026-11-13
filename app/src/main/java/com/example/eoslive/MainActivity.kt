@@ -68,12 +68,10 @@ class MainActivity : Activity() {
          */
         const val X5_STRETCH = 1.0f
 
-        /**
-         * Как класть в видео кадр другого размера (например ×5 при записи, начатой на ×1).
-         * true  — заполнить весь кадр видео: лишнее сверху и снизу обрезается, чёрных полей нет;
-         * false — вписать целиком: сверху/снизу или по бокам остаются чёрные поля.
-         */
-        const val ZOOM_FILL_FRAME = true
+
+        /** Размер кадра Live View на ×1; к таким пропорциям (3:2) обрезается кадр ×5, если обрезка включена. */
+        const val X1_W = 1024
+        const val X1_H = 680
     }
 
     private lateinit var usb: UsbManager
@@ -99,13 +97,16 @@ class MainActivity : Activity() {
     private var mic: MicCapture? = null
     // Декодирование JPEG вынесено из потока камеры: пока декодируется кадр N, камера уже отдаёт N+1.
     // В ячейке лежит только самый свежий кадр: если декодер не успевает, старые кадры пропускаются.
-    private class PendingFrame(val jpg: ByteArray, val aspect: Float)
+    private class PendingFrame(val jpg: ByteArray, val aspect: Float, val crop: Float)
     private val pendingFrame = AtomicReference<PendingFrame?>(null)
     private val decodeExec = Executors.newSingleThreadExecutor()
     private val decAcc = AtomicLong(0L) // замеры декодирования JPEG
     private val decN = AtomicInteger(0)
     private val micLock = Any()
     @Volatile private var worker: Thread? = null
+    /** Обрезка при зуме ×5: вкл — кадр режется до 3:2 (и в превью, и в записи), выкл — полный кадр. */
+    @Volatile private var cropZoom = true
+    private lateinit var btnCrop: Button
     // Запись идёт в отдельном потоке: кадры, которые надо привести к размеру видео, перекодируются там же.
     private val recQueue = LinkedBlockingQueue<Runnable>()
     private val recExec = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, recQueue)
@@ -264,6 +265,16 @@ class MainActivity : Activity() {
                     setOnClickListener { onCameraZoom(lvl) }
                 }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             }
+            btnCrop = Button(this@MainActivity).apply {
+                minWidth = 0
+                minimumWidth = 0
+                setOnClickListener {
+                    cropZoom = !cropZoom
+                    updateCropBtn()
+                }
+            }
+            addView(btnCrop, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.6f))
+            updateCropBtn()
         }
 
         logView = TextView(this).apply {
@@ -432,6 +443,10 @@ class MainActivity : Activity() {
             val pi = PendingIntent.getBroadcast(this, 0, Intent(ACTION_PERM).setPackage(packageName), flags)
             usb.requestPermission(dev, pi)
         }
+    }
+
+    private fun updateCropBtn() {
+        btnCrop.text = if (cropZoom) "Обрезка 3:2: вкл" else "Обрезка 3:2: выкл"
     }
 
     private fun setRecUi() {
@@ -716,13 +731,16 @@ class MainActivity : Activity() {
         val zoom = evfRecordInt(raw, 4) ?: 1
         // отображаемые пропорции кадра: у ×1 — как есть (0), у ×5 — с поправкой X5_STRETCH
         val aspect = if (zoom > 1 && sz != null && X5_STRETCH != 1f) sz.first.toFloat() / sz.second * X5_STRETCH else 0f
+        val crop = cropZoom && zoom > 1 && sz != null
         val wr = writer
         if (wr != null && recQueue.size < 40) {
             recExec.execute {
                 try {
+                    // обрезка включена и запись началась на ×5: видео сразу делаем 3:2, как на ×1
+                    if (crop && wr.size() == null) wr.setSize(X1_W, X1_H)
                     val have = wr.size()
-                    val out = if (have == null || (sz != null && sz.first == have.first && sz.second == have.second && aspect == 0f)) jpg
-                              else fitToSize(jpg, have.first, have.second, aspect) ?: jpg
+                    val out = if (have == null || (!crop && sz != null && sz.first == have.first && sz.second == have.second && aspect == 0f)) jpg
+                              else fitToSize(jpg, have.first, have.second, aspect, crop) ?: jpg
                     wr.addFrame(out)
                 } catch (e: Exception) { log("ошибка записи кадра: $e") }
             }
@@ -737,7 +755,7 @@ class MainActivity : Activity() {
             logContainer(raw)
         }
 
-        val prev = pendingFrame.getAndSet(PendingFrame(jpg, aspect))
+        val prev = pendingFrame.getAndSet(PendingFrame(jpg, aspect, if (crop) X1_W.toFloat() / X1_H else 0f))
         if (prev == null) {
             // ячейка была пуста — значит, задача декодирования ещё не поставлена
             try {
@@ -746,7 +764,7 @@ class MainActivity : Activity() {
                     val tD = System.nanoTime()
                     val bmp = BitmapFactory.decodeByteArray(f.jpg, 0, f.jpg.size)
                     decAcc.addAndGet(System.nanoTime() - tD); decN.incrementAndGet()
-                    if (bmp != null) runOnUiThread { zoomView.setFrame(bmp, f.aspect) }
+                    if (bmp != null) runOnUiThread { zoomView.setFrame(bmp, f.aspect, f.crop) }
                 }
             } catch (_: Exception) { pendingFrame.set(null) }
         }
@@ -767,17 +785,18 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Вписывает кадр в холст tw×th без искажений пропорций (чёрные поля), перекодирует в JPEG.
+     * Кладёт кадр на холст tw×th без искажений пропорций и перекодирует в JPEG:
+     * fill = true — заполняет весь холст, лишнее обрезается по центру; false — вписывает целиком с чёрными полями.
      * Нужен, когда размер кадра отличается от размера видео (после смены зума камеры во время записи).
      */
-    private fun fitToSize(jpg: ByteArray, tw: Int, th: Int, aspect: Float): ByteArray? {
+    private fun fitToSize(jpg: ByteArray, tw: Int, th: Int, aspect: Float, fill: Boolean): ByteArray? {
         val src = BitmapFactory.decodeByteArray(jpg, 0, jpg.size) ?: return null
         val a = if (aspect > 0f) aspect else src.width.toFloat() / src.height
         val dw: Float
         val dh: Float
         // fit: целиком с полями; fill: на весь холст с обрезкой лишнего по центру
         val wider = a >= tw.toFloat() / th
-        if (wider != ZOOM_FILL_FRAME) { dw = tw.toFloat(); dh = tw / a } else { dh = th.toFloat(); dw = th * a }
+        if (wider != fill) { dw = tw.toFloat(); dh = tw / a } else { dh = th.toFloat(); dw = th * a }
         val out = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
         val c = Canvas(out)
         c.drawColor(Color.BLACK)

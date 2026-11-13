@@ -79,8 +79,10 @@ class MjpegAviWriter(file: File, private val withAudio: Boolean = false, private
         if (!started) {
             // Размер видео = размер первого кадра. Плеер растягивает любые кадры до размера заголовка,
             // поэтому кадры другого размера (после смены зума) приложение заранее вписывает в этот размер.
-            val wh = Jpeg.size(jpeg) ?: Pair(1024, 680)
-            w = wh.first; h = wh.second
+            if (!sizeSet) {
+                val wh = Jpeg.size(jpeg) ?: Pair(1024, 680)
+                w = wh.first; h = wh.second
+            }
             raf.setLength(0)
             raf.write(header(25.0, 0, 0))
             started = true
@@ -92,8 +94,17 @@ class MjpegAviWriter(file: File, private val withAudio: Boolean = false, private
       }
     }
 
-    /** Размер видео (известен после первого кадра), иначе null. */
-    fun size(): Pair<Int, Int>? = synchronized(lock) { if (started) Pair(w, h) else null }
+    private var sizeSet = false
+
+    /** Задать размер видео заранее (до первого кадра), а не по первому кадру. */
+    fun setSize(width: Int, height: Int) {
+        synchronized(lock) {
+            if (!started) { w = width; h = height; sizeSet = true }
+        }
+    }
+
+    /** Размер видео (известен после первого кадра или после setSize), иначе null. */
+    fun size(): Pair<Int, Int>? = synchronized(lock) { if (started || sizeSet) Pair(w, h) else null }
 
     /** PCM 16 бит моно; вызывается из потока микрофона. До первого видеокадра данные отбрасываются. */
     fun addAudio(pcm: ByteArray, len: Int) {

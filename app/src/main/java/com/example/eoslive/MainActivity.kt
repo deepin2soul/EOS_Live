@@ -83,6 +83,7 @@ class MainActivity : Activity() {
     private val decAcc = AtomicLong(0L) // замеры декодирования JPEG
     private val decN = AtomicInteger(0)
     private val micLock = Any()
+    @Volatile private var worker: Thread? = null
     private val logBuf = StringBuilder()
 
     // трогаются только из рабочего потока
@@ -435,7 +436,15 @@ class MainActivity : Activity() {
             btnRecOv.isEnabled = true
             refreshSettingsUi()
         }
-        Thread { runLive(dev) }.start()
+        // новый сеанс ждёт, пока предыдущий закончит закрытие, иначе они одновременно работают с камерой
+        val old = worker
+        val t = Thread {
+            try { old?.join(10000) } catch (_: Exception) {}
+            running = true
+            runLive(dev)
+        }
+        worker = t
+        t.start()
     }
 
     /** Прочитать события камеры и обновить параметры. */
@@ -503,6 +512,7 @@ class MainActivity : Activity() {
             runOnUiThread { refreshSettingsUi() }
 
             var noReply = 0
+            var failT0 = 0L
             var notOk = 0
             var okFrames = 0L
             var secFrames = 0
@@ -534,13 +544,28 @@ class MainActivity : Activity() {
                 val r = p.getViewfinder()
                 val dtGet = System.nanoTime() - tGet0
                 if (r == null) {
+                    if (noReply == 0) {
+                        failT0 = System.nanoTime()
+                        log("GetViewFinderData: нет ответа (${p.lastError}). Возможно, камера занята (например, автофокус по полунажатию спуска). Жду и пробую снова.")
+                    }
                     noReply++
                     val still = usb.deviceList.values.any { it.vendorId == CANON_VID }
-                    log("нет ответа на GetViewFinderData ($noReply), Canon в списке USB: ${if (still) "да" else "НЕТ (отключился)"}")
-                    if (!still) break
+                    if (!still) { log("Canon пропал из списка USB — камера отключилась"); break }
+                    val down = (System.nanoTime() - failT0) / 1e9
+                    if (noReply % 10 == 0) log("  всё ещё нет ответа: %.0f с, попыток %d (%s)".format(down, noReply, p.lastError))
+                    if (down > 30) {
+                        log("камера не отвечает 30 с, стоп. Выключи и включи камеру или переподключи кабель.")
+                        break
+                    }
                     p.recover()
-                    if (noReply >= 3) { log("камера не отвечает, стоп"); break }
+                    Thread.sleep(300)
+                    // раз в ~3 с заново включаем вывод Live View на ПК
+                    if (noReply % 10 == 5) p.setProp("EVFOutputDevice=PC", 0xD1B0, 2)
                     continue
+                }
+                if (noReply > 0) {
+                    log("камера снова отвечает, перерыв %.1f с (попыток: %d)".format((System.nanoTime() - failT0) / 1e9, noReply))
+                    lastEvT = 0L
                 }
                 noReply = 0
                 val data = r.data

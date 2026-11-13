@@ -18,7 +18,12 @@ class PtpUsb(
     private val log: (String) -> Unit
 ) {
     private var tid = 0
-    private val rbuf = ByteArray(65536) // было 16384: меньше системных вызовов на кадр ~280 КБ
+
+    /** Где и с каким кодом bulkTransfer оборвалась последняя неудачная транзакция (для лога). */
+    @Volatile var lastError: String = ""
+    private var phase = ""
+    private var lastRc = 0
+    private val rbuf = ByteArray(16384)
 
     private fun le32(b: ByteArray, o: Int): Int =
         (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or
@@ -41,7 +46,7 @@ class PtpUsb(
         while (off < bytes.size) {
             val n = minOf(16384, bytes.size - off)
             val w = conn.bulkTransfer(outEp, bytes, off, n, 3000)
-            if (w <= 0) return false
+            if (w <= 0) { lastRc = w; return false }
             off += w
         }
         return true
@@ -50,6 +55,7 @@ class PtpUsb(
     private fun readChunk(): ByteArray? {
         repeat(3) {
             val n = conn.bulkTransfer(inEp, rbuf, rbuf.size, 3000)
+            lastRc = n
             if (n > 0) return rbuf.copyOf(n)
             if (n < 0) return null
         }
@@ -57,6 +63,13 @@ class PtpUsb(
     }
 
     fun transact(code: Int, params: IntArray = IntArray(0), dataOut: ByteArray? = null): PtpResult? {
+        val r = transactInner(code, params, dataOut)
+        if (r == null) lastError = "команда 0x%04X, этап «%s», код USB %d".format(code, phase, lastRc)
+        return r
+    }
+
+    private fun transactInner(code: Int, params: IntArray, dataOut: ByteArray?): PtpResult? {
+        phase = "отправка команды"
         val myTid = tid++
         val cmd = ByteArray(12 + 4 * params.size)
         put32(cmd, 0, cmd.size); put16(cmd, 4, 1); put16(cmd, 6, code); put32(cmd, 8, myTid)
@@ -71,6 +84,7 @@ class PtpUsb(
         }
 
         var data: ByteArray? = null
+        phase = "ожидание ответа"
         var first = readChunk() ?: return null
         var type = le16(first, 4)
         if (type == 2) {
@@ -79,11 +93,13 @@ class PtpUsb(
             val need = total - 12
             val out = ByteArrayOutputStream(if (need > 0) need else 16)
             out.write(first, 12, first.size - 12)
+            phase = "приём данных"
             while (out.size() < need) {
                 val c = readChunk() ?: return null
                 out.write(c, 0, c.size)
             }
             data = out.toByteArray()
+            phase = "ожидание статуса"
             first = readChunk() ?: return null
             type = le16(first, 4)
         }

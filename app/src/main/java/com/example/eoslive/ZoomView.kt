@@ -23,13 +23,22 @@ class ZoomView(ctx: Context) : View(ctx) {
     private var ty = 0f
     private val maxUser = 10f
 
+    /**
+     * Желаемое соотношение сторон картинки на экране (ширина/высота). 0 = как у самого JPEG.
+     * Нужно потому, что при зуме камеры ×5 JPEG приходит с «не квадратными» пикселями (768x800),
+     * а показывать его надо в пропорциях системы координат Live View (3:2).
+     */
+    private var aspect = 0f
+
+    private fun dispW(b: Bitmap): Float = if (aspect > 0f) b.height * aspect else b.width.toFloat()
+
     private fun fit(b: Bitmap): Float =
-        minOf(width.toFloat() / b.width, height.toFloat() / b.height)
+        minOf(width.toFloat() / dispW(b), height.toFloat() / b.height)
 
     private fun clamp() {
         val b = bmp ?: return
         val s = fit(b) * user
-        val mx = maxOf(0f, b.width * s / 2f - width / 2f)
+        val mx = maxOf(0f, dispW(b) * s / 2f - width / 2f)
         val my = maxOf(0f, b.height * s / 2f - height / 2f)
         tx = tx.coerceIn(-mx, mx)
         ty = ty.coerceIn(-my, my)
@@ -79,8 +88,9 @@ class ZoomView(ctx: Context) : View(ctx) {
 
     fun frameSize(): String = bmp?.let { "${it.width}x${it.height}" } ?: "—"
 
-    fun setFrame(b: Bitmap) {
+    fun setFrame(b: Bitmap, displayAspect: Float = 0f) {
         bmp = b
+        aspect = displayAspect
         clamp()
         invalidate()
     }
@@ -101,7 +111,7 @@ class ZoomView(ctx: Context) : View(ctx) {
         val s = fit(b) * user
         m.reset()
         m.postTranslate(-b.width / 2f, -b.height / 2f)
-        m.postScale(s, s)
+        m.postScale(s * dispW(b) / b.width, s)
         m.postTranslate(width / 2f + tx, height / 2f + ty)
         c.drawBitmap(b, m, paint)
     }

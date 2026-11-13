@@ -602,11 +602,39 @@ class MainActivity : Activity() {
 
         if (uiBusy.compareAndSet(false, true)) {
             val bmp = BitmapFactory.decodeByteArray(jpg, 0, jpg.size)
+            val aspect = evfAspect(raw)
             runOnUiThread {
-                if (bmp != null) zoomView.setFrame(bmp)
+                if (bmp != null) zoomView.setFrame(bmp, aspect)
                 uiBusy.set(false)
             }
         }
+    }
+
+    /**
+     * Соотношение сторон системы координат Live View (запись типа 5: ширина, высота, напр. 1560x1040).
+     * Именно в таких пропорциях кадр надо показывать: при зуме ×5 сам JPEG имеет другие пропорции
+     * (768x800), и без этой поправки превью выглядит почти квадратным. Если записи нет — 0 (как у JPEG).
+     */
+    private fun evfAspect(d: ByteArray): Float {
+        fun le32(o: Int) = (d[o].toInt() and 0xFF) or ((d[o + 1].toInt() and 0xFF) shl 8) or
+            ((d[o + 2].toInt() and 0xFF) shl 16) or ((d[o + 3].toInt() and 0xFF) shl 24)
+        var off = 0
+        while (off + 8 <= d.size) {
+            val size = le32(off)
+            val type = le32(off + 4)
+            if (size < 8 || off + size > d.size) break
+            if (type == 5 && size >= 16) {
+                val w = le32(off + 8)
+                val h = le32(off + 12)
+                if (w > 0 && h > 0) {
+                    val r = w.toFloat() / h
+                    if (r in 1.2f..2.0f) return r
+                }
+                break
+            }
+            off += size
+        }
+        return 0f
     }
 
     /** Структура данных GetViewFinderData: записи [размер][тип][...]. Для диагностики зума. */

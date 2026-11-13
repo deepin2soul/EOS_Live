@@ -114,6 +114,11 @@ class MainActivity : Activity() {
 
     // трогаются только из рабочего потока
     private var writer: MjpegAviWriter? = null
+    private var mp4: Mp4Recorder? = null
+    /** Кто сейчас пишет (writer или mp4): нужен, чтобы поздно открывшийся микрофон не подключился к чужой записи. */
+    @Volatile private var recOwner: Any? = null
+    @Volatile private var recSettings = RecordSettings()
+    private lateinit var btnRecSet: Button
     private var tmpFile: File? = null
 
     // параметры камеры
@@ -151,11 +156,13 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         usb = getSystemService(Context.USB_SERVICE) as UsbManager
+        recSettings = RecordSettingsStore.load(this)
         buildUi()
         val f = IntentFilter(ACTION_PERM)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(receiver, f)
         log("Готово. Подключи 40D по USB (через OTG) и нажми «Старт Live View».")
+        log("запись: " + recSettings.summary())
     }
 
     override fun onDestroy() {
@@ -196,6 +203,18 @@ class MainActivity : Activity() {
         }
         topRow.addView(btnLive, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         topRow.addView(btnRec, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        btnRecSet = Button(this).apply {
+            text = "⚙ Запись"
+            isAllCaps = false
+            setOnClickListener {
+                showRecordSettingsDialog(this@MainActivity, recSettings) { ns ->
+                    recSettings = ns
+                    RecordSettingsStore.save(this@MainActivity, ns)
+                    log("настройки записи: " + ns.summary())
+                }
+            }
+        }
+        topRow.addView(btnRecSet, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.8f))
 
         // картинка + кнопки поверх неё (запись и полный экран)
         zoomView = ZoomView(this).apply { setBackgroundColor(Color.BLACK) }
@@ -657,7 +676,7 @@ class MainActivity : Activity() {
                 if (now - secT >= 1_000_000_000L) {
                     val fps = secFrames * 1e9 / (now - secT)
                     secFrames = 0; secT = now
-                    val rec = if (writer != null) " ● идёт запись" else ""
+                    val rec = if (isRecActive()) " ● идёт запись" else ""
                     runOnUiThread { status.text = "%.1f к/с, кадр %s, вид %dx%d%s".format(fps, lastFrameDims, zoomView.width, zoomView.height, rec) }
                 }
                 if (now - stT >= 5_000_000_000L) {
@@ -684,7 +703,7 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             log("ошибка: $e")
         } finally {
-            try { if (writer != null) finishRecording() } catch (e: Exception) { log("ошибка сохранения: $e") }
+            try { if (isRecActive()) finishRecording() } catch (e: Exception) { log("ошибка сохранения: $e") }
             try {
                 ptp?.op("TerminateViewfinder", 0x9152)
                 ptp?.setProp("EVFOutputDevice=0", 0xD1B0, 0)
@@ -705,33 +724,65 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun handleFrame(jpg: ByteArray, raw: ByteArray) {
-        if (recording && writer == null) {
-            val f = File(cacheDir, "rec_${System.currentTimeMillis()}.avi")
-            tmpFile = f
-            val hasMic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-            val w = MjpegAviWriter(f, withAudio = hasMic)
-            writer = w
-            log("запись началась" + if (hasMic) " (звук подключается)" else " (без звука)")
-            if (hasMic) {
-                // открытие микрофона занимает сотни мс — делаем в отдельном потоке, чтобы не стопорить камеру
-                Thread {
-                    val m = MicCapture(44100) { buf, n -> w.addAudio(buf, n) }
-                    val ok = m.start()
-                    synchronized(micLock) {
-                        if (ok && writer === w) mic = m
-                        else { if (ok) m.stop(); if (!ok) log("микрофон не открылся, запись без звука") }
-                    }
-                }.start()
+    private fun isRecActive() = writer != null || mp4 != null
+
+    private fun startMic(owner: Any, rate: Int, onData: (ByteArray, Int) -> Unit, onFail: () -> Unit) {
+        // открытие микрофона занимает сотни мс — делаем в отдельном потоке, чтобы не стопорить камеру
+        Thread {
+            val m = MicCapture(rate, onData)
+            val ok = m.start()
+            synchronized(micLock) {
+                if (ok && recOwner === owner) mic = m
+                else {
+                    if (ok) m.stop()
+                    else { log("микрофон не открылся, запись без звука"); onFail() }
+                }
             }
-        } else if (!recording && writer != null) {
-            finishRecording()
+        }.start()
+    }
+
+    private fun startRecording(sz: Pair<Int, Int>?, crop: Boolean) {
+        val cfg = recSettings
+        val hasMic = cfg.audioOn && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (cfg.isMp4) {
+            // обрезка включена и запись началась на ×5: видео сразу 3:2, как на ×1
+            val vw = if (crop) X1_W else (sz?.first ?: X1_W)
+            val vh = if (crop) X1_H else (sz?.second ?: X1_H)
+            val f = File(cacheDir, "rec_${System.currentTimeMillis()}.mp4")
+            val m = Mp4Recorder(f, cfg, vw, vh, hasMic) { log(it) }
+            if (m.start()) {
+                tmpFile = f
+                mp4 = m
+                recOwner = m
+                log("запись началась (MP4): " + m.describe())
+                if (hasMic) startMic(m, cfg.audioRate, { buf, n -> m.addAudio(buf, n) }, { m.audioFailed() })
+                return
+            }
+            f.delete()
+            log("кодировщик не запустился, пишу в AVI")
         }
+        val f = File(cacheDir, "rec_${System.currentTimeMillis()}.avi")
+        tmpFile = f
+        val w = MjpegAviWriter(f, withAudio = hasMic)
+        writer = w
+        recOwner = w
+        log("запись началась (AVI)" + if (hasMic) " (звук подключается)" else " (без звука)")
+        if (hasMic) startMic(w, 44100, { buf, n -> w.addAudio(buf, n) }, {})
+    }
+
+    private fun handleFrame(jpg: ByteArray, raw: ByteArray) {
         val sz = Jpeg.size(jpg)
         val zoom = evfRecordInt(raw, 4) ?: 1
         // отображаемые пропорции кадра: у ×1 — как есть (0), у ×5 — с поправкой X5_STRETCH
         val aspect = if (zoom > 1 && sz != null && X5_STRETCH != 1f) sz.first.toFloat() / sz.second * X5_STRETCH else 0f
         val crop = cropZoom && zoom > 1 && sz != null
+        if (recording && !isRecActive()) {
+            startRecording(sz, crop)
+        } else if (!recording && isRecActive()) {
+            finishRecording()
+        }
+        // MP4: кадр уходит в отдельные потоки декодирования и кодирования, поток камеры не ждёт
+        mp4?.offerFrame(jpg, aspect, crop)
         val wr = writer
         if (wr != null && recQueue.size < 40) {
             recExec.execute {
@@ -833,34 +884,38 @@ class MainActivity : Activity() {
     }
 
     private fun finishRecording() {
-        val w = writer ?: return
+        val w = writer
+        val m = mp4
+        if (w == null && m == null) return
         writer = null
-        synchronized(micLock) { mic?.stop(); mic = null }
+        mp4 = null
+        synchronized(micLock) { recOwner = null; mic?.stop(); mic = null }
         val f = tmpFile ?: return
         // финиш и копирование в «Фильмы» идут в потоке записи, после всех уже поставленных кадров
         recExec.execute {
             try {
-                val n = w.finish()
-                if (n == 0) { log("запись пустая"); f.delete() } else saveToMovies(f, n)
+                val n = m?.finish() ?: w!!.finish()
+                if (n == 0) { log("запись пустая"); f.delete() } else saveToMovies(f, n, if (m != null) "mp4" else "avi")
             } catch (e: Exception) { log("ошибка сохранения: $e") }
         }
     }
 
-    private fun saveToMovies(f: File, n: Int) {
+    private fun saveToMovies(f: File, n: Int, ext: String) {
         try {
-        val name = "eos_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".avi"
+        val name = "eos_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + "." + ext
         val v = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/x-msvideo")
+            put(MediaStore.Video.Media.MIME_TYPE, if (ext == "mp4") "video/mp4" else "video/x-msvideo")
             put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/EOSLive")
         }
         val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)
         if (uri == null) { log("не удалось создать файл в Movies"); return }
+        val mb = f.length() / 1e6
         contentResolver.openOutputStream(uri)?.use { out ->
             f.inputStream().use { it.copyTo(out) }
         }
         f.delete()
-        log("сохранено: Movies/EOSLive/$name, кадров: $n")
+        log("сохранено: Movies/EOSLive/$name, кадров: $n, %.1f МБ".format(mb))
         } catch (e: Exception) { log("ошибка сохранения: $e") }
     }
 }

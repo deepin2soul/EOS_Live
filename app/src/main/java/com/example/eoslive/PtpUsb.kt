@@ -18,7 +18,7 @@ class PtpUsb(
     private val log: (String) -> Unit
 ) {
     private var tid = 0
-    private val rbuf = ByteArray(16384)
+    private val rbuf = ByteArray(65536) // было 16384: меньше системных вызовов на кадр ~280 КБ
 
     private fun le32(b: ByteArray, o: Int): Int =
         (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or

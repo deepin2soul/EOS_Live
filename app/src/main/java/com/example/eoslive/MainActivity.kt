@@ -41,6 +41,10 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : Activity() {
@@ -71,9 +75,14 @@ class MainActivity : Activity() {
     @Volatile private var running = false
     @Volatile private var recording = false
     private var mic: MicCapture? = null
-    private var decAcc = 0L // замеры декодирования JPEG (только поток камеры)
-    private var decN = 0
-    private val uiBusy = AtomicBoolean(false)
+    // Декодирование JPEG вынесено из потока камеры: пока декодируется кадр N, камера уже отдаёт N+1.
+    // В ячейке лежит только самый свежий кадр: если декодер не успевает, старые кадры пропускаются.
+    private class PendingFrame(val jpg: ByteArray, val aspect: Float)
+    private val pendingFrame = AtomicReference<PendingFrame?>(null)
+    private val decodeExec = Executors.newSingleThreadExecutor()
+    private val decAcc = AtomicLong(0L) // замеры декодирования JPEG
+    private val decN = AtomicInteger(0)
+    private val micLock = Any()
     private val logBuf = StringBuilder()
 
     // трогаются только из рабочего потока
@@ -125,6 +134,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         running = false
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
+        decodeExec.shutdownNow()
         super.onDestroy()
     }
 
@@ -508,7 +518,7 @@ class MainActivity : Activity() {
             var stGetEmpty = 0L; var stEmptyN = 0
             var stHandle = 0L; var stEvents = 0L; var stSleep = 0L
             var lastFrameT = 0L; var stMaxGap = 0L
-            decAcc = 0L; decN = 0
+            decAcc.set(0L); decN.set(0)
 
             while (running) {
                 // команды из интерфейса (ползунки, зум камеры)
@@ -595,7 +605,7 @@ class MainActivity : Activity() {
                     log("  GetViewFinderData с кадром: %.1f мс в среднем (%.0f КБ, %.2f МБ/с); пустых 0xA102: %d, по %.1f мс".format(
                         ms(stGetOk, stGetOkN), kb, mbs, stEmptyN, ms(stGetEmpty, stEmptyN)))
                     log("  обработка кадра: %.1f мс (из них декодирование JPEG %.1f мс ×%d); события+keep-alive: %.1f мс/с; sleep: %.0f мс/с".format(
-                        ms(stHandle, stGetOkN), if (decN > 0) decAcc / 1e6 / decN else 0.0, decN,
+                        ms(stHandle, stGetOkN), if (decN.get() > 0) decAcc.get() / 1e6 / decN.get() else 0.0, decN.get(),
                         stEvents / 1e6 / win, stSleep / 1e6 / win))
                     val camShare = (stGetOk + stGetEmpty) / 1e9 / win * 100
                     val appShare = (stHandle + stEvents + stSleep) / 1e9 / win * 100
@@ -603,7 +613,7 @@ class MainActivity : Activity() {
                     stT = now
                     stGetOk = 0; stGetOkN = 0; stBytes = 0; stGetEmpty = 0; stEmptyN = 0
                     stHandle = 0; stEvents = 0; stSleep = 0; stMaxGap = 0
-                    decAcc = 0; decN = 0
+                    decAcc.set(0L); decN.set(0)
                 }
             }
         } catch (e: Exception) {
@@ -632,16 +642,23 @@ class MainActivity : Activity() {
 
     private fun handleFrame(jpg: ByteArray, raw: ByteArray) {
         if (recording && writer == null) {
-            val f = File(cacheDir, "rec.avi")
+            val f = File(cacheDir, "rec_${System.currentTimeMillis()}.avi")
             tmpFile = f
             val hasMic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
             val w = MjpegAviWriter(f, withAudio = hasMic)
             writer = w
+            log("запись началась" + if (hasMic) " (звук подключается)" else " (без звука)")
             if (hasMic) {
-                val m = MicCapture(44100) { buf, n -> w.addAudio(buf, n) }
-                if (m.start()) mic = m else log("микрофон не открылся, запись без звука")
+                // открытие микрофона занимает сотни мс — делаем в отдельном потоке, чтобы не стопорить камеру
+                Thread {
+                    val m = MicCapture(44100) { buf, n -> w.addAudio(buf, n) }
+                    val ok = m.start()
+                    synchronized(micLock) {
+                        if (ok && writer === w) mic = m
+                        else { if (ok) m.stop(); if (!ok) log("микрофон не открылся, запись без звука") }
+                    }
+                }.start()
             }
-            log("запись началась" + if (mic != null) " (со звуком)" else " (без звука)")
         } else if (!recording && writer != null) {
             finishRecording()
         }
@@ -656,15 +673,18 @@ class MainActivity : Activity() {
             logContainer(raw)
         }
 
-        if (uiBusy.compareAndSet(false, true)) {
-            val tD = System.nanoTime()
-            val bmp = BitmapFactory.decodeByteArray(jpg, 0, jpg.size)
-            decAcc += System.nanoTime() - tD; decN++
-            val aspect = evfAspect(raw)
-            runOnUiThread {
-                if (bmp != null) zoomView.setFrame(bmp, aspect)
-                uiBusy.set(false)
-            }
+        val prev = pendingFrame.getAndSet(PendingFrame(jpg, evfAspect(raw)))
+        if (prev == null) {
+            // ячейка была пуста — значит, задача декодирования ещё не поставлена
+            try {
+                decodeExec.execute {
+                    val f = pendingFrame.getAndSet(null) ?: return@execute
+                    val tD = System.nanoTime()
+                    val bmp = BitmapFactory.decodeByteArray(f.jpg, 0, f.jpg.size)
+                    decAcc.addAndGet(System.nanoTime() - tD); decN.incrementAndGet()
+                    if (bmp != null) runOnUiThread { zoomView.setFrame(bmp, f.aspect) }
+                }
+            } catch (_: Exception) { pendingFrame.set(null) }
         }
     }
 
@@ -721,11 +741,16 @@ class MainActivity : Activity() {
     private fun finishRecording() {
         val w = writer ?: return
         writer = null
-        mic?.stop()
-        mic = null
+        synchronized(micLock) { mic?.stop(); mic = null }
         val n = w.finish()
         val f = tmpFile ?: return
         if (n == 0) { log("запись пустая"); f.delete(); return }
+        // копирование в «Фильмы» может занять секунду — делаем в фоне, чтобы Live View не замирал
+        Thread { saveToMovies(f, n) }.start()
+    }
+
+    private fun saveToMovies(f: File, n: Int) {
+        try {
         val name = "eos_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".avi"
         val v = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, name)
@@ -739,5 +764,6 @@ class MainActivity : Activity() {
         }
         f.delete()
         log("сохранено: Movies/EOSLive/$name, кадров: $n")
+        } catch (e: Exception) { log("ошибка сохранения: $e") }
     }
 }

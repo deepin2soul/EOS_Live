@@ -12,7 +12,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Color
 import android.graphics.Typeface
 import android.hardware.usb.UsbConstants
@@ -36,12 +40,16 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -52,6 +60,13 @@ class MainActivity : Activity() {
     companion object {
         const val CANON_VID = 0x04A9
         const val ACTION_PERM = "com.example.eoslive.USB_PERMISSION"
+
+        /**
+         * Множитель ширины для кадров при зуме камеры ×5. 1.0 = пиксели квадратные, кадр показывается как пришёл
+         * (768x800). Если круг на ×5 выглядит овалом: шире, чем выше — уменьши (например 0.9),
+         * выше, чем шире — увеличь. Действует и на превью, и на запись.
+         */
+        const val X5_STRETCH = 1.0f
     }
 
     private lateinit var usb: UsbManager
@@ -84,6 +99,9 @@ class MainActivity : Activity() {
     private val decN = AtomicInteger(0)
     private val micLock = Any()
     @Volatile private var worker: Thread? = null
+    // Запись идёт в отдельном потоке: кадры, которые надо привести к размеру видео, перекодируются там же.
+    private val recQueue = LinkedBlockingQueue<Runnable>()
+    private val recExec = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, recQueue)
     private val logBuf = StringBuilder()
 
     // трогаются только из рабочего потока
@@ -687,9 +705,23 @@ class MainActivity : Activity() {
         } else if (!recording && writer != null) {
             finishRecording()
         }
-        writer?.addFrame(jpg)
+        val sz = Jpeg.size(jpg)
+        val zoom = evfRecordInt(raw, 4) ?: 1
+        // отображаемые пропорции кадра: у ×1 — как есть (0), у ×5 — с поправкой X5_STRETCH
+        val aspect = if (zoom > 1 && sz != null && X5_STRETCH != 1f) sz.first.toFloat() / sz.second * X5_STRETCH else 0f
+        val wr = writer
+        if (wr != null && recQueue.size < 40) {
+            recExec.execute {
+                try {
+                    val have = wr.size()
+                    val out = if (have == null || (sz != null && sz.first == have.first && sz.second == have.second && aspect == 0f)) jpg
+                              else fitToSize(jpg, have.first, have.second, aspect) ?: jpg
+                    wr.addFrame(out)
+                } catch (e: Exception) { log("ошибка записи кадра: $e") }
+            }
+        }
 
-        val dims = Jpeg.size(jpg)?.let { "${it.first}x${it.second}" } ?: "?"
+        val dims = sz?.let { "${it.first}x${it.second}" } ?: "?"
         if (dims != lastFrameDims) {
             lastFrameDims = dims
             val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -698,7 +730,7 @@ class MainActivity : Activity() {
             logContainer(raw)
         }
 
-        val prev = pendingFrame.getAndSet(PendingFrame(jpg, evfAspect(raw)))
+        val prev = pendingFrame.getAndSet(PendingFrame(jpg, aspect))
         if (prev == null) {
             // ячейка была пуста — значит, задача декодирования ещё не поставлена
             try {
@@ -713,31 +745,40 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Соотношение сторон системы координат Live View (запись типа 5: ширина, высота, напр. 1560x1040).
-     * Именно в таких пропорциях кадр надо показывать: при зуме ×5 сам JPEG имеет другие пропорции
-     * (768x800), и без этой поправки превью выглядит почти квадратным. Если записи нет — 0 (как у JPEG).
-     */
-    private fun evfAspect(d: ByteArray): Float {
+    /** Первое число записи заданного типа в данных GetViewFinderData (тип 4 — уровень зума камеры). */
+    private fun evfRecordInt(d: ByteArray, type: Int): Int? {
         fun le32(o: Int) = (d[o].toInt() and 0xFF) or ((d[o + 1].toInt() and 0xFF) shl 8) or
             ((d[o + 2].toInt() and 0xFF) shl 16) or ((d[o + 3].toInt() and 0xFF) shl 24)
         var off = 0
         while (off + 8 <= d.size) {
             val size = le32(off)
-            val type = le32(off + 4)
             if (size < 8 || off + size > d.size) break
-            if (type == 5 && size >= 16) {
-                val w = le32(off + 8)
-                val h = le32(off + 12)
-                if (w > 0 && h > 0) {
-                    val r = w.toFloat() / h
-                    if (r in 1.2f..2.0f) return r
-                }
-                break
-            }
+            if (le32(off + 4) == type) return if (size >= 12) le32(off + 8) else null
             off += size
         }
-        return 0f
+        return null
+    }
+
+    /**
+     * Вписывает кадр в холст tw×th без искажений пропорций (чёрные поля), перекодирует в JPEG.
+     * Нужен, когда размер кадра отличается от размера видео (после смены зума камеры во время записи).
+     */
+    private fun fitToSize(jpg: ByteArray, tw: Int, th: Int, aspect: Float): ByteArray? {
+        val src = BitmapFactory.decodeByteArray(jpg, 0, jpg.size) ?: return null
+        val a = if (aspect > 0f) aspect else src.width.toFloat() / src.height
+        val dw: Float
+        val dh: Float
+        if (a >= tw.toFloat() / th) { dw = tw.toFloat(); dh = tw / a } else { dh = th.toFloat(); dw = th * a }
+        val out = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        c.drawColor(Color.BLACK)
+        val l = (tw - dw) / 2f
+        val t = (th - dh) / 2f
+        c.drawBitmap(src, null, RectF(l, t, l + dw, t + dh), Paint(Paint.FILTER_BITMAP_FLAG))
+        val bos = ByteArrayOutputStream()
+        out.compress(Bitmap.CompressFormat.JPEG, 88, bos)
+        src.recycle(); out.recycle()
+        return bos.toByteArray()
     }
 
     /** Структура данных GetViewFinderData: записи [размер][тип][...]. Для диагностики зума. */
@@ -767,11 +808,14 @@ class MainActivity : Activity() {
         val w = writer ?: return
         writer = null
         synchronized(micLock) { mic?.stop(); mic = null }
-        val n = w.finish()
         val f = tmpFile ?: return
-        if (n == 0) { log("запись пустая"); f.delete(); return }
-        // копирование в «Фильмы» может занять секунду — делаем в фоне, чтобы Live View не замирал
-        Thread { saveToMovies(f, n) }.start()
+        // финиш и копирование в «Фильмы» идут в потоке записи, после всех уже поставленных кадров
+        recExec.execute {
+            try {
+                val n = w.finish()
+                if (n == 0) { log("запись пустая"); f.delete() } else saveToMovies(f, n)
+            } catch (e: Exception) { log("ошибка сохранения: $e") }
+        }
     }
 
     private fun saveToMovies(f: File, n: Int) {

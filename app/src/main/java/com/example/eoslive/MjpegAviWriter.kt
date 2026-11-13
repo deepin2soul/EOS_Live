@@ -59,11 +59,6 @@ class MjpegAviWriter(file: File, private val withAudio: Boolean = false, private
     private var t0 = 0L
     private var started = false
 
-    private companion object {
-        const val VIDEO_W = 1200
-        const val VIDEO_H = 800
-    }
-
     private val headerSize = if (withAudio) 324 else 224
     private val moviTag = (headerSize - 4).toLong() // позиция слова 'movi' в файле
 
@@ -82,10 +77,10 @@ class MjpegAviWriter(file: File, private val withAudio: Boolean = false, private
     fun addFrame(jpeg: ByteArray) {
       synchronized(lock) {
         if (!started) {
-            // Размер в заголовке фиксированный 3:2 и не зависит от первого кадра: камера на ×1 шлёт 1024x680,
-            // на ×5 — 768x800 (непрямоугольные пиксели). Плеер растягивает любой кадр до размера заголовка,
-            // поэтому при заголовке 3:2 оба режима выглядят правильно, даже если зум менялся во время записи.
-            w = VIDEO_W; h = VIDEO_H
+            // Размер видео = размер первого кадра. Плеер растягивает любые кадры до размера заголовка,
+            // поэтому кадры другого размера (после смены зума) приложение заранее вписывает в этот размер.
+            val wh = Jpeg.size(jpeg) ?: Pair(1024, 680)
+            w = wh.first; h = wh.second
             raf.setLength(0)
             raf.write(header(25.0, 0, 0))
             started = true
@@ -96,6 +91,9 @@ class MjpegAviWriter(file: File, private val withAudio: Boolean = false, private
         if (jpeg.size > maxChunk) maxChunk = jpeg.size
       }
     }
+
+    /** Размер видео (известен после первого кадра), иначе null. */
+    fun size(): Pair<Int, Int>? = synchronized(lock) { if (started) Pair(w, h) else null }
 
     /** PCM 16 бит моно; вызывается из потока микрофона. До первого видеокадра данные отбрасываются. */
     fun addAudio(pcm: ByteArray, len: Int) {

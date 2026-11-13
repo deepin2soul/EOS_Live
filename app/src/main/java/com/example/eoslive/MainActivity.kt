@@ -90,6 +90,7 @@ class MainActivity : Activity() {
     private var sliderList = IntArray(0)
     private var seeking = false
     private var fullscreen = false
+    @Volatile private var lastFrameDims = ""
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -216,7 +217,7 @@ class MainActivity : Activity() {
             addView(TextView(this@MainActivity).apply { text = "Зум камеры:" })
             for (lvl in intArrayOf(1, 5, 10)) {
                 addView(Button(this@MainActivity).apply {
-                    text = "×$lvl"
+                    text = if (lvl == 10) "×10*" else "×$lvl"
                     minWidth = 0
                     minimumWidth = 0
                     setOnClickListener { onCameraZoom(lvl) }
@@ -305,13 +306,20 @@ class MainActivity : Activity() {
         cmdQ.add { p -> p.setProp(nm, prop, v) }
     }
 
+    /**
+     * Камера по PTP принимает зум 1 и 5 (на 40D значение 10 даёт тот же ×5), поэтому
+     * «×10» = зум камеры ×5 + цифровое ×2 в приложении.
+     */
     private fun onCameraZoom(level: Int) {
         if (!running) {
             Toast.makeText(this, "Сначала Старт Live View", Toast.LENGTH_SHORT).show()
             return
         }
+        val camLevel = if (level >= 5) 5 else 1
+        val digital = if (level >= 10) 2f else 1f
+        zoomView.setUserZoom(digital)
         cmdQ.add { p ->
-            val r = p.op("Зум камеры ×$level", 0x9158, intArrayOf(level))
+            val r = p.op("Зум камеры ×$camLevel (кнопка ×$level)", 0x9158, intArrayOf(camLevel))
             if (r == null || r.code != 0x2001) {
                 runOnUiThread {
                     Toast.makeText(this, "Камера не приняла зум (код " +
@@ -545,7 +553,7 @@ class MainActivity : Activity() {
                     val fps = secFrames * 1e9 / (now - secT)
                     secFrames = 0; secT = now
                     val rec = if (writer != null) " ● идёт запись" else ""
-                    runOnUiThread { status.text = "%.1f к/с, кадров всего: %d%s".format(fps, okFrames, rec) }
+                    runOnUiThread { status.text = "%.1f к/с, кадр %s, вид %dx%d%s".format(fps, lastFrameDims, zoomView.width, zoomView.height, rec) }
                 }
             }
         } catch (e: Exception) {
@@ -582,6 +590,12 @@ class MainActivity : Activity() {
             finishRecording()
         }
         writer?.addFrame(jpg)
+
+        val dims = Jpeg.size(jpg)?.let { "${it.first}x${it.second}" } ?: "?"
+        if (dims != lastFrameDims) {
+            lastFrameDims = dims
+            log("размер кадра JPEG: $dims, вид: ${zoomView.width}x${zoomView.height}")
+        }
 
         if (uiBusy.compareAndSet(false, true)) {
             val bmp = BitmapFactory.decodeByteArray(jpg, 0, jpg.size)

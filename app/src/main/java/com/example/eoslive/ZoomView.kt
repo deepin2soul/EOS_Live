@@ -69,6 +69,16 @@ class ZoomView(ctx: Context) : View(ctx) {
         }
     })
 
+    /** Задать цифровое увеличение (1 = вписать в экран) и вернуть картинку в центр. */
+    fun setUserZoom(v: Float) {
+        user = v.coerceIn(1f, maxUser)
+        tx = 0f; ty = 0f
+        clamp()
+        invalidate()
+    }
+
+    fun frameSize(): String = bmp?.let { "${it.width}x${it.height}" } ?: "—"
+
     fun setFrame(b: Bitmap) {
         bmp = b
         clamp()

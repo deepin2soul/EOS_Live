@@ -527,7 +527,7 @@ class MainActivity : Activity() {
                     } else {
                         okFrames++
                         secFrames++
-                        handleFrame(jpg)
+                        handleFrame(jpg, data)
                     }
                 } else {
                     notOk++
@@ -580,7 +580,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun handleFrame(jpg: ByteArray) {
+    private fun handleFrame(jpg: ByteArray, raw: ByteArray) {
         if (recording && writer == null) {
             val f = File(cacheDir, "rec.avi")
             tmpFile = f
@@ -594,7 +594,10 @@ class MainActivity : Activity() {
         val dims = Jpeg.size(jpg)?.let { "${it.first}x${it.second}" } ?: "?"
         if (dims != lastFrameDims) {
             lastFrameDims = dims
-            log("размер кадра JPEG: $dims, вид: ${zoomView.width}x${zoomView.height}")
+            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(jpg, 0, jpg.size, o)
+            log("размер кадра JPEG: $dims, декодер: ${o.outWidth}x${o.outHeight}, вид: ${zoomView.width}x${zoomView.height}")
+            logContainer(raw)
         }
 
         if (uiBusy.compareAndSet(false, true)) {
@@ -604,6 +607,29 @@ class MainActivity : Activity() {
                 uiBusy.set(false)
             }
         }
+    }
+
+    /** Структура данных GetViewFinderData: записи [размер][тип][...]. Для диагностики зума. */
+    private fun logContainer(d: ByteArray) {
+        fun le32(o: Int) = (d[o].toInt() and 0xFF) or ((d[o + 1].toInt() and 0xFF) shl 8) or
+            ((d[o + 2].toInt() and 0xFF) shl 16) or ((d[o + 3].toInt() and 0xFF) shl 24)
+        val sb = StringBuilder("записи кадра (всего ${d.size} Б):")
+        var off = 0
+        var n = 0
+        while (off + 8 <= d.size && n < 12) {
+            val size = le32(off)
+            val type = le32(off + 4)
+            if (size < 8 || off + size > d.size) { sb.append(" [стоп на $off: size=$size type=$type]"); break }
+            sb.append(" [тип $type, $size Б")
+            if (type != 1 && size > 8) {
+                val k = minOf(size - 8, 32)
+                sb.append(": ").append((0 until k).joinToString(" ") { "%02X".format(d[off + 8 + it]) })
+            }
+            sb.append("]")
+            off += size
+            n++
+        }
+        log(sb.toString())
     }
 
     private fun finishRecording() {

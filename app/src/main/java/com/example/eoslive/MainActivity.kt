@@ -211,7 +211,7 @@ class MainActivity : Activity() {
             if (!conn.claimInterface(itf, true)) { log("claimInterface не удался"); return }
             itfClaimed = itf
 
-            val p = PtpUsb(conn, inE, outE) { log(it) }
+            val p = PtpUsb(conn, inE, outE, itf.id) { log(it) }
             ptp = p
 
             p.op("OpenSession", 0x1002, intArrayOf(1))
@@ -220,33 +220,36 @@ class MainActivity : Activity() {
             p.op("GetEvent", 0x9116)
             p.setProp("EVFMode=1", 0xD1B1, 1)
             p.setProp("EVFOutputDevice=PC", 0xD1B0, 2)
-            p.op("InitiateViewfinder", 0x9151)
-            Thread.sleep(500)
+            // InitiateViewfinder (0x9151) на 40D даёт 0x2005 — не используем, как и libgphoto2.
+            // Камера поднимает зеркало и стартует поток 1–3 с: сливаем события и ждём.
             p.op("GetEvent", 0x9116)
 
-            var useParam = true
             var noReply = 0
             var notOk = 0
             var okFrames = 0L
             var secFrames = 0
             var secT = System.nanoTime()
             var firstLogged = false
+            val startT = System.nanoTime()
+            var lastEvT = startT
 
             while (running) {
-                val r = p.getViewfinder(useParam)
+                val r = p.getViewfinder()
                 if (r == null) {
                     noReply++
-                    if (noReply > 5) { log("камера не отвечает, стоп"); break }
+                    log("нет ответа на GetViewFinderData ($noReply) — сбрасываю канал")
+                    p.recover()
+                    if (noReply >= 3) { log("камера не отвечает, стоп"); break }
                     continue
                 }
                 noReply = 0
                 val data = r.data
-                if (r.code == 0x2001 && data != null) {
+                if (r.code == 0x2001 && data != null && data.isNotEmpty()) {
                     notOk = 0
                     if (!firstLogged) {
                         firstLogged = true
                         val head = data.take(16).joinToString(" ") { "%02X".format(it) }
-                        log("первый кадр: ${data.size} Б, начало: $head")
+                        log("первый кадр: ${data.size} Б, начало: $head, через ${(System.nanoTime() - startT) / 1_000_000} мс")
                     }
                     val jpg = Jpeg.extract(data)
                     if (jpg == null) {
@@ -258,12 +261,14 @@ class MainActivity : Activity() {
                     }
                 } else {
                     notOk++
-                    if (notOk <= 5 || notOk % 20 == 0) log("GetViewFinderData -> 0x%04X (подряд: $notOk)".format(r.code))
-                    if (notOk == 5 && useParam) { useParam = false; log("пробую без параметра") }
-                    if (notOk > 100) { log("Live View не запустился, стоп"); break }
+                    if (notOk <= 3 || notOk % 20 == 0) log("GetViewFinderData -> 0x%04X (подряд: $notOk)".format(r.code))
+                    // 0xA102 = камера ещё не готова: ждём до ~15 с, сливая события
+                    if (notOk > 150) { log("Live View не запустился за 15 с, стоп"); break }
+                    p.transact(0x9116)
+                    lastEvT = System.nanoTime()
                     Thread.sleep(100)
                 }
-                if (okFrames > 0 && okFrames % 40 == 0L) p.transact(0x9116)
+                if (System.nanoTime() - lastEvT > 500_000_000L) { p.transact(0x9116); lastEvT = System.nanoTime() }
 
                 val now = System.nanoTime()
                 if (now - secT >= 1_000_000_000L) {

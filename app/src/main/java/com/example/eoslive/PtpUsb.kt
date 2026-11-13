@@ -14,6 +14,7 @@ class PtpUsb(
     private val conn: UsbDeviceConnection,
     private val inEp: UsbEndpoint,
     private val outEp: UsbEndpoint,
+    private val ifaceId: Int,
     private val log: (String) -> Unit
 ) {
     private var tid = 0
@@ -109,6 +110,21 @@ class PtpUsb(
         return op("SetProp $name", 0x9110, dataOut = d)
     }
 
-    fun getViewfinder(useParam: Boolean): PtpResult? =
-        transact(0x9153, if (useParam) intArrayOf(0x00100000) else IntArray(0))
+    /** Параметр 0x00100000 нужен всегда (так делает libgphoto2); без него камера «залипает». */
+    fun getViewfinder(): PtpResult? = transact(0x9153, intArrayOf(0x00100000))
+
+    /**
+     * Вывести канал из зависшей транзакции: PTP Cancel (class request 0x64),
+     * сброс STALL на обоих bulk-эндпоинтах и слив остатков из IN.
+     */
+    fun recover() {
+        try {
+            val c = ByteArray(6)
+            put16(c, 0, 0x4001); put32(c, 2, tid - 1)
+            conn.controlTransfer(0x21, 0x64, 0, ifaceId, c, c.size, 1000)
+            conn.controlTransfer(0x02, 0x01, 0, inEp.address, null, 0, 1000)
+            conn.controlTransfer(0x02, 0x01, 0, outEp.address, null, 0, 1000)
+            repeat(8) { if (conn.bulkTransfer(inEp, rbuf, rbuf.size, 200) <= 0) return }
+        } catch (_: Exception) {}
+    }
 }

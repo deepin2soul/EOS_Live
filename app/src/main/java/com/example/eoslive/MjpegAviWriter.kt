@@ -53,12 +53,19 @@ class MjpegAviWriter(file: File) {
     private var t0 = 0L
     private var started = false
 
+    private companion object {
+        const val VIDEO_W = 1200
+        const val VIDEO_H = 800
+    }
+
     private val moviTag = 220L // позиция слова 'movi' в файле
 
     fun addFrame(jpeg: ByteArray) {
         if (!started) {
-            val wh = Jpeg.size(jpeg) ?: Pair(1024, 680)
-            w = wh.first; h = wh.second
+            // Размер в заголовке фиксированный 3:2 и не зависит от первого кадра: камера на ×1 шлёт 1024x680,
+            // на ×5 — 768x800 (непрямоугольные пиксели). Плеер растягивает любой кадр до размера заголовка,
+            // поэтому при заголовке 3:2 оба режима выглядят правильно, даже если зум менялся во время записи.
+            w = VIDEO_W; h = VIDEO_H
             raf.setLength(0)
             raf.write(header(25.0, 0, 0))
             started = true

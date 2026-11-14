@@ -22,6 +22,7 @@ class PhotoCapture(
     /** Причина неудачи (для сообщения пользователю), если снимок не получен. */
     var error: String? = null
         private set
+    private var dead = false
 
     private fun le32(b: ByteArray, o: Int): Int =
         (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or
@@ -41,7 +42,6 @@ class PhotoCapture(
         val files = ArrayList<PhotoFile>()
         try {
             // 1. выйти из Live View: зеркало должно опуститься, иначе камера занята
-            p.op("TerminateViewfinder", 0x9152)
             p.setProp("EVFOutputDevice=0", 0xD1B0, 0)
             pump(700)
 
@@ -52,12 +52,19 @@ class PhotoCapture(
             p.setProp("CaptureDestination=телефон", 0xD11C, 4)
             pump(200)
 
-            // 3. спуск затвора
-            val rel = p.op("RemoteRelease (спуск затвора)", 0x910F)
-            if (rel == null || rel.code != 0x2001) {
-                error = if (rel == null) "камера не ответила на спуск (${p.lastError})"
-                else "камера не приняла спуск, код 0x%04X (нет карты, объектив на MF, режим «Bulb» или камера занята)".format(rel.code)
+            // 3. спуск затвора. Камера отвечает на эту команду только когда снимок готов
+            // (автофокус + выдержка), поэтому ждём долго, иначе ответ придёт позже и собьёт обмен
+            val oldT = p.ioTimeoutMs
+            p.ioTimeoutMs = ((expSec + 20.0) * 1000).toInt()
+            val rel = try { p.op("RemoteRelease (спуск затвора)", 0x910F) } finally { p.ioTimeoutMs = oldT }
+            if (rel != null && rel.code != 0x2001) {
+                error = "камера не приняла спуск, код 0x%04X (нет карты, объектив на MF, режим «Bulb» или камера занята)".format(rel.code)
                 return files
+            }
+            if (rel == null) {
+                // снимок мог быть сделан: не бросаем, а проверяем события камеры
+                log("нет ответа на спуск (${p.lastError}); проверяю, не пришёл ли файл")
+                p.drainIn(500)
             }
             progress("Экспозиция %.1f с…".format(expSec))
 
@@ -72,7 +79,7 @@ class PhotoCapture(
                 val ev = p.transact(0x9116)
                 if (ev == null) {
                     nulls++
-                    if (nulls > 15) { error = "камера перестала отвечать"; break }
+                    if (nulls > 15) { error = "камера перестала отвечать"; dead = true; break }
                     p.recover()
                     Thread.sleep(200)
                     continue
@@ -112,8 +119,9 @@ class PhotoCapture(
             }
             if (files.isEmpty() && error == null) error = "файл не удалось скачать (смотри лог)"
         } finally {
-            // вернуть Live View
+            // вернуть сохранение на карту (иначе обычные снимки с камеры пойдут «в никуда») и Live View
             try {
+                if (!dead) p.setProp("CaptureDestination=карта", 0xD11C, 1)
                 p.setProp("EVFMode=1", 0xD1B1, 1)
                 p.setProp("EVFOutputDevice=PC", 0xD1B0, 2)
                 pump(300)

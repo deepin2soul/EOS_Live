@@ -25,6 +25,9 @@ class PtpUsb(
     private var lastRc = 0
     private val rbuf = ByteArray(16384)
 
+    /** Таймаут одной USB-передачи, мс. Для долгих команд (спуск затвора) временно увеличивается. */
+    @Volatile var ioTimeoutMs = 3000
+
     private fun le32(b: ByteArray, o: Int): Int =
         (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or
             ((b[o + 2].toInt() and 0xFF) shl 16) or ((b[o + 3].toInt() and 0xFF) shl 24)
@@ -45,7 +48,7 @@ class PtpUsb(
         var off = 0
         while (off < bytes.size) {
             val n = minOf(16384, bytes.size - off)
-            val w = conn.bulkTransfer(outEp, bytes, off, n, 3000)
+            val w = conn.bulkTransfer(outEp, bytes, off, n, ioTimeoutMs)
             if (w <= 0) { lastRc = w; return false }
             off += w
         }
@@ -54,7 +57,7 @@ class PtpUsb(
 
     private fun readChunk(): ByteArray? {
         repeat(3) {
-            val n = conn.bulkTransfer(inEp, rbuf, rbuf.size, 3000)
+            val n = conn.bulkTransfer(inEp, rbuf, rbuf.size, ioTimeoutMs)
             lastRc = n
             if (n > 0) return rbuf.copyOf(n)
             if (n < 0) return null
@@ -108,6 +111,14 @@ class PtpUsb(
             return null
         }
         return PtpResult(le16(first, 6), data)
+    }
+
+    /** Прочитать и выбросить всё, что камера успела прислать (запоздавшие ответы), пока не затихнет на 200 мс. */
+    fun drainIn(maxMs: Int) {
+        val end = System.nanoTime() + maxMs * 1_000_000L
+        while (System.nanoTime() < end) {
+            if (conn.bulkTransfer(inEp, rbuf, rbuf.size, 200) <= 0) return
+        }
     }
 
     /** Вызов с записью результата в лог (для редких команд, не для каждого кадра). */

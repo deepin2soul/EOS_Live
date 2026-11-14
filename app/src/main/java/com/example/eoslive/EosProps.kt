@@ -117,6 +117,9 @@ object EosFmt {
         return if (r == 0.0) "0" else "%+.1f".format(r)
     }
 
+    /** Выдержка в секундах по коду Tv (для Bulb не использовать). */
+    fun seconds(code: Int): Double = Math.pow(2.0, (0x38 - code) / 8.0)
+
     fun label(prop: Int, v: Int): String = when (prop) {
         EosProp.ISO -> iso[v] ?: "0x%02X".format(v)
         EosProp.AV -> av[v] ?: "f/%.1f".format(Math.pow(2.0, (v - 8) / 16.0))
@@ -124,5 +127,69 @@ object EosFmt {
         EosProp.EXPCOMP -> comp(v)
         EosProp.WB -> wb[v] ?: "WB $v"
         else -> "0x%X".format(v)
+    }
+}
+
+/** Файл, о котором камера сообщила в событии (после снимка). */
+class EosObj(
+    val oid: Int,
+    val name: String,
+    /** Размер из записи события, 0 — если определить не удалось. */
+    val sizeHint: Int,
+    /** true — камера просит забрать файл (0xC186, сохранение в память камеры для ПК), false — файл на карте (0xC181). */
+    val transfer: Boolean,
+    val raw: ByteArray
+)
+
+object EosEvents {
+    private fun le32(b: ByteArray, o: Int): Int =
+        (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or
+            ((b[o + 2].toInt() and 0xFF) shl 16) or ((b[o + 3].toInt() and 0xFF) shl 24)
+
+    private fun plausible(n: Int) = n in 20_000..300_000_000
+
+    private val nameRe = Regex("[A-Za-z0-9_\\-]{1,16}\\.(JPG|JPEG|CR2|CRW|THM)", RegexOption.IGNORE_CASE)
+
+    /** Записи «появился файл» (0xC181) и «забери файл» (0xC186). Размер и имя ищутся с запасом на разные варианты формата. */
+    fun objects(d: ByteArray?): List<EosObj> {
+        val res = ArrayList<EosObj>()
+        if (d == null) return res
+        var off = 0
+        while (off + 8 <= d.size) {
+            val size = le32(d, off)
+            val type = le32(d, off + 4)
+            if (size < 8 || off + size > d.size) break
+            if ((type == 0xC181 || type == 0xC186) && size >= 0x20) {
+                val transfer = type == 0xC186
+                val s14 = if (size >= 0x18) le32(d, off + 0x14) else 0
+                val s1c = if (size >= 0x20) le32(d, off + 0x1c) else 0
+                val hint = if (transfer) { if (plausible(s14)) s14 else if (plausible(s1c)) s1c else 0 }
+                           else { if (plausible(s1c)) s1c else 0 }
+                val sb = StringBuilder()
+                for (k in 8 until size) {
+                    val c = d[off + k].toInt() and 0xFF
+                    sb.append(if (c in 32..126) c.toChar() else '\u0000')
+                }
+                val name = nameRe.find(sb)?.value ?: ""
+                res.add(EosObj(le32(d, off + 8), name, hint, transfer, d.copyOfRange(off, off + size)))
+            }
+            off += size
+        }
+        return res
+    }
+
+    /** Типы событий, кроме изменений параметров: для лога. */
+    fun otherTypes(d: ByteArray?): String {
+        if (d == null) return ""
+        val sb = StringBuilder()
+        var off = 0
+        while (off + 8 <= d.size) {
+            val size = le32(d, off)
+            val type = le32(d, off + 4)
+            if (size < 8 || off + size > d.size) break
+            if (type != 0xC189 && type != 0xC18A && type != 0) sb.append(" 0x%X(%d Б)".format(type, size))
+            off += size
+        }
+        return sb.toString()
     }
 }

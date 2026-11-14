@@ -27,6 +27,9 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.InputType
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.View
@@ -34,6 +37,7 @@ import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -119,6 +123,34 @@ class MainActivity : Activity() {
     @Volatile private var recOwner: Any? = null
     @Volatile private var recSettings = RecordSettings()
     private lateinit var btnRecSet: Button
+
+    // --- режимы: видео / фото / длинная выдержка ---
+    private enum class Mode { VIDEO, PHOTO, STACK }
+    @Volatile private var mode = Mode.VIDEO
+    /** Пока true, кадры Live View не перезаписывают картинку в превью (там снимок или результат суммирования). */
+    @Volatile private var holdPreview = false
+    @Volatile private var photoBusy = false
+    private val ui = Handler(Looper.getMainLooper())
+    private lateinit var btnMode: Button
+    private lateinit var videoPanel: LinearLayout
+    private lateinit var photoPanel: LinearLayout
+    private lateinit var stackPanel: LinearLayout
+    private lateinit var btnShoot: Button
+    private lateinit var btnStackMode: Button
+    private lateinit var etStackSec: EditText
+    private lateinit var btnStackMethod: Button
+    private lateinit var btnStackGo: Button
+    private lateinit var btnBack: Button
+    private lateinit var infoOv: TextView
+    @Volatile private var stack: LongExposure? = null
+    @Volatile private var stackActive = false
+    private var stackT0 = 0L
+    private var stackTimed = true
+    private var stackSec = 30.0
+    private var stackMethod = StackMethod.SUM
+    private var stackTargetSec = 30.0
+    @Volatile private var lastAspect = 0f
+    @Volatile private var lastCrop = 0f
     private var tmpFile: File? = null
 
     // параметры камеры
@@ -157,6 +189,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         usb = getSystemService(Context.USB_SERVICE) as UsbManager
         recSettings = RecordSettingsStore.load(this)
+        loadStackPrefs()
         buildUi()
         val f = IntentFilter(ACTION_PERM)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED)
@@ -167,6 +200,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         running = false
+        ui.removeCallbacksAndMessages(null)
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
         decodeExec.shutdownNow()
         super.onDestroy()
@@ -191,18 +225,25 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
         }
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
         topRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btnLive = Button(this).apply {
             text = "Старт Live View"
             setOnClickListener { onLiveClick() }
         }
+        btnMode = Button(this).apply {
+            isAllCaps = false
+            setOnClickListener { cycleMode() }
+        }
+        topRow.addView(btnLive, LinearLayout.LayoutParams(0, wrap, 1f))
+        topRow.addView(btnMode, LinearLayout.LayoutParams(0, wrap, 1f))
+
+        // панель «Видео»
         btnRec = Button(this).apply {
             text = "● Запись"
             isEnabled = false
             setOnClickListener { onRecClick() }
         }
-        topRow.addView(btnLive, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        topRow.addView(btnRec, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         btnRecSet = Button(this).apply {
             text = "⚙ Запись"
             isAllCaps = false
@@ -214,20 +255,93 @@ class MainActivity : Activity() {
                 }
             }
         }
-        topRow.addView(btnRecSet, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.8f))
+        videoPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btnRec, LinearLayout.LayoutParams(0, wrap, 1f))
+            addView(btnRecSet, LinearLayout.LayoutParams(0, wrap, 0.8f))
+        }
+
+        // панель «Фото»
+        btnShoot = Button(this).apply {
+            text = "📷 Снять"
+            isEnabled = false
+            setOnClickListener { onShootClick() }
+        }
+        photoPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(btnShoot)
+            addView(TextView(this@MainActivity).apply {
+                textSize = 11f
+                text = "Снимок сразу передаётся на телефон (Pictures/EOSLive) и показывается в превью. " +
+                    "На время снимка Live View прерывается и потом включается сам."
+            })
+        }
+
+        // панель «Выдержка» (суммирование кадров Live View на телефоне)
+        btnStackMode = Button(this).apply {
+            isAllCaps = false
+            textSize = 12f
+            setOnClickListener {
+                if (!stackActive) { stackTimed = !stackTimed; saveStackPrefs(); updateStackUi() }
+            }
+        }
+        etStackSec = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setSingleLine()
+            textSize = 14f
+            gravity = Gravity.CENTER
+            hint = "сек"
+            setText(if (stackSec == Math.floor(stackSec)) stackSec.toInt().toString() else stackSec.toString())
+        }
+        btnStackMethod = Button(this).apply {
+            isAllCaps = false
+            textSize = 12f
+            setOnClickListener {
+                if (!stackActive) {
+                    stackMethod = StackMethod.values()[(stackMethod.ordinal + 1) % StackMethod.values().size]
+                    saveStackPrefs()
+                    updateStackUi()
+                }
+            }
+        }
+        btnStackGo = Button(this).apply {
+            isEnabled = false
+            setOnClickListener { onStackClick() }
+        }
+        stackPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(btnStackMode, LinearLayout.LayoutParams(0, wrap, 1.3f))
+                addView(etStackSec, LinearLayout.LayoutParams(0, wrap, 0.7f))
+                addView(btnStackMethod, LinearLayout.LayoutParams(0, wrap, 1f))
+            })
+            addView(btnStackGo)
+        }
 
         // картинка + кнопки поверх неё (запись и полный экран)
         zoomView = ZoomView(this).apply { setBackgroundColor(Color.BLACK) }
-        btnRecOv = smallBtn("●") { onRecClick() }.apply { isEnabled = false }
+        btnRecOv = smallBtn("●") { onMainAction() }.apply { isEnabled = false }
         btnFull = smallBtn("⛶") { setFullscreen(!fullscreen) }
         val overlay = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(btnRecOv)
             addView(btnFull)
         }
+        btnBack = smallBtn("✕ К Live View") { onBackClick() }.apply { visibility = View.GONE; textSize = 13f }
+        infoOv = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0x99000000.toInt())
+            textSize = 13f
+            setPadding(12, 6, 12, 6)
+            visibility = View.GONE
+        }
         val frame = FrameLayout(this).apply {
             addView(zoomView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END))
+            addView(btnBack, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
+            addView(infoOv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START))
         }
 
         status = TextView(this).apply { text = "—" }
@@ -310,6 +424,9 @@ class MainActivity : Activity() {
             }
         }
         root.addView(topRow)
+        root.addView(videoPanel)
+        root.addView(photoPanel)
+        root.addView(stackPanel)
         root.addView(frame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 3f))
         root.addView(status)
         root.addView(settingsRow)
@@ -319,6 +436,8 @@ class MainActivity : Activity() {
         root.addView(btnCopy)
         setContentView(root)
         refreshSettingsUi()
+        applyModeUi()
+        setRecUi()
     }
 
     private fun nameOf(prop: Int): String = props.firstOrNull { it.first == prop }?.second ?: "?"
@@ -404,6 +523,7 @@ class MainActivity : Activity() {
         fullscreen = on
         val vis = if (on) View.GONE else View.VISIBLE
         topRow.visibility = vis
+        applyModeUi()
         status.visibility = vis
         settingsRow.visibility = vis
         sliderBox.visibility = vis
@@ -468,10 +588,28 @@ class MainActivity : Activity() {
         btnCrop.text = if (cropZoom) "Обрезка 3:2: вкл" else "Обрезка 3:2: выкл"
     }
 
+    /** Обновляет кнопки всех режимов по текущему состоянию (только из UI-потока). */
     private fun setRecUi() {
-        val t = if (recording) "■ Стоп записи" else "● Запись"
-        btnRec.text = t
-        btnRecOv.text = if (recording) "■" else "●"
+        val live = running
+        btnRec.text = if (recording) "■ Стоп записи" else "● Запись"
+        btnRec.isEnabled = live && !stackActive && !photoBusy
+        btnShoot.text = if (photoBusy) "Снимаю…" else "📷 Снять"
+        btnShoot.isEnabled = live && !photoBusy && !stackActive && !recording
+        btnStackGo.text = if (stackActive) "■ Стоп и сохранить" else "▶ Старт суммирования"
+        btnStackGo.isEnabled = live && !photoBusy && !recording
+        btnRecOv.text = when (mode) {
+            Mode.VIDEO -> if (recording) "■" else "●"
+            Mode.PHOTO -> if (photoBusy) "…" else "📷"
+            Mode.STACK -> if (stackActive) "■" else "▶"
+        }
+        btnRecOv.isEnabled = when (mode) {
+            Mode.VIDEO -> btnRec.isEnabled
+            Mode.PHOTO -> btnShoot.isEnabled
+            Mode.STACK -> btnStackGo.isEnabled
+        }
+        btnBack.visibility = if (holdPreview) View.VISIBLE else View.GONE
+        btnBack.text = if (stackActive) "✕ Отмена" else "✕ К Live View"
+        updateStackUi()
     }
 
     private fun onRecClick() {
@@ -491,8 +629,7 @@ class MainActivity : Activity() {
         cmdQ.clear()
         runOnUiThread {
             btnLive.text = "Стоп Live View"
-            btnRec.isEnabled = true
-            btnRecOv.isEnabled = true
+            setRecUi()
             refreshSettingsUi()
         }
         // новый сеанс ждёт, пока предыдущий закончит закрытие, иначе они одновременно работают с камерой
@@ -704,6 +841,8 @@ class MainActivity : Activity() {
             log("ошибка: $e")
         } finally {
             try { if (isRecActive()) finishRecording() } catch (e: Exception) { log("ошибка сохранения: $e") }
+            if (stackActive) { log("Live View остановлен во время суммирования — сохраняю то, что набрано"); runOnUiThread { stopStack(true) } }
+            photoBusy = false
             try {
                 ptp?.op("TerminateViewfinder", 0x9152)
                 ptp?.setProp("EVFOutputDevice=0", 0xD1B0, 0)
@@ -717,11 +856,241 @@ class MainActivity : Activity() {
             log("Live View остановлен")
             runOnUiThread {
                 btnLive.text = "Старт Live View"
-                btnRec.isEnabled = false
-                btnRecOv.isEnabled = false
                 setRecUi()
             }
         }
+    }
+
+    // ------------------------------------------------------------------ режимы: видео / фото / выдержка
+
+    private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_LONG).show() }
+
+    private fun showInfo(s: String?) = runOnUiThread {
+        if (s.isNullOrEmpty()) infoOv.visibility = View.GONE
+        else { infoOv.text = s; infoOv.visibility = View.VISIBLE }
+    }
+
+    private fun fmtDur(sec: Double): String =
+        if (sec >= 60) "%d мин %.1f с".format((sec / 60).toInt(), sec - (sec / 60).toInt() * 60)
+        else "%.1f с".format(sec)
+
+    private fun applyModeUi() {
+        btnMode.text = "Режим: " + when (mode) { Mode.VIDEO -> "видео"; Mode.PHOTO -> "фото"; Mode.STACK -> "выдержка" }
+        videoPanel.visibility = if (!fullscreen && mode == Mode.VIDEO) View.VISIBLE else View.GONE
+        photoPanel.visibility = if (!fullscreen && mode == Mode.PHOTO) View.VISIBLE else View.GONE
+        stackPanel.visibility = if (!fullscreen && mode == Mode.STACK) View.VISIBLE else View.GONE
+    }
+
+    private fun cycleMode() {
+        if (stackActive) { toast("Сначала останови суммирование"); return }
+        if (recording) { toast("Сначала останови запись"); return }
+        if (photoBusy) return
+        mode = Mode.values()[(mode.ordinal + 1) % Mode.values().size]
+        releaseHold()
+        applyModeUi()
+        setRecUi()
+    }
+
+    /** Большая кнопка на картинке (видно и в полноэкранном режиме): действие зависит от режима. */
+    private fun onMainAction() {
+        when (mode) {
+            Mode.VIDEO -> onRecClick()
+            Mode.PHOTO -> onShootClick()
+            Mode.STACK -> onStackClick()
+        }
+    }
+
+    private fun releaseHold() {
+        holdPreview = false
+        infoOv.visibility = View.GONE
+        btnBack.visibility = View.GONE
+    }
+
+    private fun onBackClick() {
+        if (stackActive) stopStack(false) else { releaseHold(); setRecUi() }
+    }
+
+    /** Показать картинку в превью и не давать Live View её перезаписать, пока не нажмут «К Live View». */
+    private fun showHeld(bmp: Bitmap, aspect: Float, crop: Float, info: String) = runOnUiThread {
+        holdPreview = true
+        zoomView.setFrame(bmp, aspect, crop)
+        infoOv.text = info
+        infoOv.visibility = View.VISIBLE
+        setRecUi()
+    }
+
+    // ------------------------------------------------------------------ фото
+
+    private fun onShootClick() {
+        if (!running) { Toast.makeText(this, "Сначала Старт Live View", Toast.LENGTH_SHORT).show(); return }
+        if (photoBusy || stackActive || recording) return
+        val tv = eos.value(EosProp.TV)
+        if (tv == 0x0C) {
+            Toast.makeText(this, "Выдержка Bulb в режиме «Фото» не поддерживается: выбери обычную выдержку (длинную можно набрать в режиме «Выдержка»)", Toast.LENGTH_LONG).show()
+            return
+        }
+        val expSec = if (tv != null) EosFmt.seconds(tv) else 1.0
+        photoBusy = true
+        releaseHold()
+        setRecUi()
+        showInfo("Снимаю…")
+        cmdQ.add { p ->
+            val t0 = System.nanoTime()
+            try {
+                val pc = PhotoCapture(p, eos, { log(it) }, { showInfo(it) }, { runOnUiThread { refreshSettingsUi() } })
+                val files = pc.shoot(expSec)
+                val secs = (System.nanoTime() - t0) / 1e9
+                val err = pc.error
+                // сохранение и декодирование — не в потоке камеры, чтобы Live View вернулся сразу
+                Thread { onPhotos(files, secs, err) }.start()
+            } catch (e: Exception) {
+                log("ошибка снимка: $e")
+                showInfo(null)
+            } finally {
+                photoBusy = false
+                runOnUiThread { setRecUi() }
+            }
+        }
+    }
+
+    private fun onPhotos(files: List<PhotoFile>, secs: Double, err: String?) {
+        if (files.isEmpty()) {
+            val msg = "Снимок не получен" + (if (err != null) ": $err" else "")
+            log(msg)
+            showInfo(null)
+            toast(msg)
+            return
+        }
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        var shown = false
+        val lines = ArrayList<String>()
+        for (f in files) {
+            val jpeg = PhotoUtil.isJpegName(f.name)
+            val saved = Gallery.saveBytes(this, f.data, "eos_${stamp}_${f.name}", if (jpeg) "image/jpeg" else "image/x-canon-cr2")
+            val mb = "%.1f".format(f.data.size / 1e6)
+            log("снимок ${f.name}, $mb МБ -> " + (saved ?: "не удалось сохранить в галерею"))
+            lines.add("${f.name}, $mb МБ" + if (saved == null) " (не сохранён!)" else "")
+            if (!shown) {
+                val jpg = if (jpeg) f.data else PhotoUtil.embeddedJpeg(f.data)
+                val bmp = jpg?.let { PhotoUtil.decodeForView(it) }
+                if (bmp != null) {
+                    shown = true
+                    val info = "Снимок: " + lines.joinToString("; ") + " · %.1f с\nСохранён в ${Gallery.DIR}".format(secs)
+                    showHeld(bmp, 0f, 0f, info)
+                    runOnUiThread { zoomView.setUserZoom(1f) }
+                }
+            }
+        }
+        if (!shown) showInfo("Снимок получен: " + lines.joinToString("; ") + " (показать не удалось)")
+    }
+
+    // ------------------------------------------------------------------ длинная выдержка (суммирование кадров Live View)
+
+    private fun loadStackPrefs() {
+        val p = getSharedPreferences("stack_settings", Context.MODE_PRIVATE)
+        stackTimed = p.getBoolean("timed", true)
+        stackSec = p.getFloat("sec", 30f).toDouble()
+        stackMethod = try { StackMethod.valueOf(p.getString("method", "SUM") ?: "SUM") } catch (_: Exception) { StackMethod.SUM }
+    }
+
+    private fun saveStackPrefs() {
+        getSharedPreferences("stack_settings", Context.MODE_PRIVATE).edit()
+            .putBoolean("timed", stackTimed)
+            .putFloat("sec", stackSec.toFloat())
+            .putString("method", stackMethod.name)
+            .apply()
+    }
+
+    private fun updateStackUi() {
+        btnStackMode.text = if (stackTimed) "По времени, с:" else "Бесконечная"
+        etStackSec.visibility = if (stackTimed) View.VISIBLE else View.GONE
+        etStackSec.isEnabled = !stackActive
+        btnStackMethod.text = "Метод: " + stackMethod.label
+    }
+
+    private fun onStackClick() {
+        if (stackActive) stopStack(true) else startStack()
+    }
+
+    private fun startStack() {
+        if (!running) { Toast.makeText(this, "Сначала Старт Live View", Toast.LENGTH_SHORT).show(); return }
+        if (recording || photoBusy) return
+        if (stackTimed) {
+            stackSec = etStackSec.text.toString().replace(',', '.').toDoubleOrNull()?.coerceIn(0.5, 36000.0) ?: stackSec
+        }
+        saveStackPrefs()
+        stackTargetSec = stackSec
+        val le = LongExposure(stackMethod, { log(it) }) { bmp ->
+            runOnUiThread { if (stackActive) zoomView.setFrame(bmp, lastAspect, lastCrop) }
+        }
+        stack = le
+        le.start()
+        stackT0 = System.nanoTime()
+        holdPreview = true
+        stackActive = true
+        infoOv.text = "Суммирование…"
+        infoOv.visibility = View.VISIBLE
+        log("суммирование: старт, метод «${stackMethod.label}», " + if (stackTimed) "по времени ${fmtDur(stackTargetSec)}" else "бесконечная (стоп вручную)")
+        setRecUi()
+        ui.post(ticker)
+    }
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            if (!stackActive) return
+            val el = (System.nanoTime() - stackT0) / 1e9
+            val st = stack
+            val n = st?.frames ?: 0
+            val d = (st?.dropped ?: 0) + (st?.rejected ?: 0)
+            infoOv.text = "Выдержка: ${fmtDur(el)}" + (if (stackTimed) " из ${fmtDur(stackTargetSec)}" else " (без ограничения)") +
+                "\nкадров: $n" + (if (d > 0) " (пропущено $d)" else "")
+            if (stackTimed && el >= stackTargetSec) { stopStack(true); return }
+            ui.postDelayed(this, 150)
+        }
+    }
+
+    /** save = true: итог показывается в превью и сохраняется в галерею; false: отмена, результат выбрасывается. */
+    private fun stopStack(save: Boolean) {
+        if (!stackActive) return
+        stackActive = false
+        ui.removeCallbacks(ticker)
+        val elapsed = (System.nanoTime() - stackT0) / 1e9
+        val st = stack
+        stack = null
+        if (st == null) { releaseHold(); setRecUi(); return }
+        if (!save) {
+            Thread { st.finish() }.start()
+            log("суммирование отменено")
+            releaseHold()
+            setRecUi()
+            return
+        }
+        val asp = lastAspect
+        val cr = lastCrop
+        val label = stackMethod.label
+        infoOv.text = "Завершаю суммирование…"
+        setRecUi()
+        Thread {
+            val res = st.finish()
+            val n = st.frames
+            if (res == null || n == 0) {
+                log("суммирование: кадров не было, нечего сохранять")
+                runOnUiThread { releaseHold(); setRecUi() }
+                return@Thread
+            }
+            val skipped = st.dropped + st.rejected
+            val name = "eos_stack_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + "_" + Math.round(elapsed) + "s.jpg"
+            val saved = Gallery.saveJpeg(this, res, name)
+            val line = "Готово: ${fmtDur(elapsed)}, кадров $n" + (if (skipped > 0) " (пропущено $skipped)" else "") + ", метод «$label»"
+            log(line + " -> " + (saved ?: "не удалось сохранить"))
+            runOnUiThread {
+                holdPreview = true
+                zoomView.setFrame(res, asp, cr)
+                infoOv.text = line + "\n" + (if (saved != null) "Сохранено: $saved" else "Не удалось сохранить в галерею!")
+                infoOv.visibility = View.VISIBLE
+                setRecUi()
+            }
+        }.start()
     }
 
     private fun isRecActive() = writer != null || mp4 != null
@@ -776,6 +1145,10 @@ class MainActivity : Activity() {
         // отображаемые пропорции кадра: у ×1 — как есть (0), у ×5 — с поправкой X5_STRETCH
         val aspect = if (zoom > 1 && sz != null && X5_STRETCH != 1f) sz.first.toFloat() / sz.second * X5_STRETCH else 0f
         val crop = cropZoom && zoom > 1 && sz != null
+        lastAspect = aspect
+        lastCrop = if (crop) X1_W.toFloat() / X1_H else 0f
+        val st = stack
+        if (stackActive && st != null) st.offer(jpg)
         if (recording && !isRecActive()) {
             startRecording(sz, crop)
         } else if (!recording && isRecActive()) {
@@ -806,6 +1179,8 @@ class MainActivity : Activity() {
             logContainer(raw)
         }
 
+        // на экране снимок или результат суммирования — Live View не декодируем и не показываем
+        if (holdPreview) return
         val prev = pendingFrame.getAndSet(PendingFrame(jpg, aspect, if (crop) X1_W.toFloat() / X1_H else 0f))
         if (prev == null) {
             // ячейка была пуста — значит, задача декодирования ещё не поставлена
@@ -815,7 +1190,7 @@ class MainActivity : Activity() {
                     val tD = System.nanoTime()
                     val bmp = BitmapFactory.decodeByteArray(f.jpg, 0, f.jpg.size)
                     decAcc.addAndGet(System.nanoTime() - tD); decN.incrementAndGet()
-                    if (bmp != null) runOnUiThread { zoomView.setFrame(bmp, f.aspect, f.crop) }
+                    if (bmp != null && !holdPreview) runOnUiThread { if (!holdPreview) zoomView.setFrame(bmp, f.aspect, f.crop) }
                 }
             } catch (_: Exception) { pendingFrame.set(null) }
         }

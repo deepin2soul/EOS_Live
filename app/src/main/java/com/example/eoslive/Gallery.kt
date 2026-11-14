@@ -38,6 +38,10 @@ object Gallery {
 }
 
 object PhotoUtil {
+    /** JPEG по содержимому (начало FF D8 FF). */
+    fun isJpeg(d: ByteArray): Boolean =
+        d.size > 3 && d[0] == 0xFF.toByte() && d[1] == 0xD8.toByte() && d[2] == 0xFF.toByte()
+
     fun isJpegName(name: String): Boolean {
         val n = name.lowercase()
         return n.endsWith(".jpg") || n.endsWith(".jpeg")

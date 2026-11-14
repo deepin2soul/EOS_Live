@@ -120,7 +120,7 @@ class PhotoCapture(
                     p.transact(0x911A, intArrayOf(0x7FFFFFFF, 0x1000, 1))
                 }
                 if (data != null && data.isNotEmpty()) {
-                    val n = if (o.name.isNotEmpty()) o.name else "IMG_%08X.JPG".format(o.oid)
+                    val n = if (o.name.isNotEmpty()) o.name else "IMG_%08X.%s".format(o.oid, extFor(data, o))
                     files.add(PhotoFile(n, data))
                 }
             }
@@ -138,6 +138,16 @@ class PhotoCapture(
     }
 
     private fun plausible(n: Int) = n in 20_000..300_000_000
+
+    /** Расширение по содержимому файла (имя камера в событии не прислала). */
+    private fun extFor(d: ByteArray, o: EosObj): String = when {
+        PhotoUtil.isJpeg(d) -> "JPG"
+        d.size > 10 && d[0] == 'I'.code.toByte() && d[1] == 'I'.code.toByte() && d[2] == 0x2A.toByte() ->
+            if (d[8] == 'C'.code.toByte() && d[9] == 'R'.code.toByte()) "CR2" else "TIF"
+        o.format == 0x3801 -> "JPG"
+        o.format == 0xB103 -> "CR2"
+        else -> "BIN"
+    }
 
     /** Размер файла: сначала стандартным GetObjectInfo, потом из записи события. 0 — неизвестен. */
     private fun objectSize(o: EosObj): Int {
@@ -178,7 +188,7 @@ class PhotoCapture(
         }
         var data = out.toByteArray()
         // JPEG должен кончаться маркером FFD9; если нет — размер определён неверно, докачиваем
-        if (PhotoUtil.isJpegName(o.name) && data.isNotEmpty() && !endsWithEoi(data)) {
+        if ((PhotoUtil.isJpegName(o.name) || PhotoUtil.isJpeg(data)) && data.isNotEmpty() && !endsWithEoi(data)) {
             var tries = 0
             while (!endsWithEoi(data) && tries < 40) {
                 tries++

@@ -965,7 +965,7 @@ class MainActivity : Activity() {
         var shown = false
         val lines = ArrayList<String>()
         for (f in files) {
-            val jpeg = PhotoUtil.isJpegName(f.name)
+            val jpeg = PhotoUtil.isJpeg(f.data)
             val saved = Gallery.saveBytes(this, f.data, "eos_${stamp}_${f.name}", if (jpeg) "image/jpeg" else "image/x-canon-cr2")
             val mb = "%.1f".format(f.data.size / 1e6)
             log("снимок ${f.name}, $mb МБ -> " + (saved ?: "не удалось сохранить в галерею"))

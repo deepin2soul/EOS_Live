@@ -136,6 +136,8 @@ class EosObj(
     val name: String,
     /** Размер из записи события, 0 — если определить не удалось. */
     val sizeHint: Int,
+    /** Код формата из записи 0xC186 (0x3801 — JPEG, 0xB103 — CR2), 0 если неизвестен. */
+    val format: Int,
     /** true — камера просит забрать файл (0xC186, сохранение в память камеры для ПК), false — файл на карте (0xC181). */
     val transfer: Boolean,
     val raw: ByteArray
@@ -171,7 +173,8 @@ object EosEvents {
                     sb.append(if (c in 32..126) c.toChar() else '\u0000')
                 }
                 val name = nameRe.find(sb)?.value ?: ""
-                res.add(EosObj(le32(d, off + 8), name, hint, transfer, d.copyOfRange(off, off + size)))
+                val fmt = if (transfer) le32(d, off + 0x0C) else 0
+                res.add(EosObj(le32(d, off + 8), name, hint, fmt, transfer, d.copyOfRange(off, off + size)))
             }
             off += size
         }

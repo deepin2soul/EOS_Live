@@ -557,7 +557,7 @@ class MainActivity : Activity() {
         val line = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date()) + " " + s
         val text = synchronized(logBuf) {
             logBuf.append(line).append('\n')
-            if (logBuf.length > 20000) logBuf.delete(0, logBuf.length - 15000)
+            if (logBuf.length > 60000) logBuf.delete(0, logBuf.length - 45000)
             logBuf.toString()
         }
         runOnUiThread {
@@ -816,7 +816,7 @@ class MainActivity : Activity() {
                     val rec = if (isRecActive()) " ● идёт запись" else ""
                     runOnUiThread { status.text = "%.1f к/с, кадр %s, вид %dx%d%s".format(fps, lastFrameDims, zoomView.width, zoomView.height, rec) }
                 }
-                if (now - stT >= 5_000_000_000L) {
+                if (now - stT >= 30_000_000_000L) {
                     val win = (now - stT) / 1e9
                     fun ms(ns: Long, n: Int) = if (n > 0) ns / 1e6 / n else 0.0
                     val kb = if (stGetOkN > 0) stBytes / 1024.0 / stGetOkN else 0.0

@@ -51,6 +51,10 @@ class PhotoCapture(
                 ", допустимо=" + (lst?.joinToString { "0x%X".format(it) } ?: "нет данных"))
             p.setProp("CaptureDestination=телефон", 0xD11C, 4)
             pump(200)
+            // При сохранении на ПК камере нужно сообщить, сколько у ПК свободного места (у Canon SDK это EdsSetCapacity).
+            // Без этого камера после щелчка зависает на «busy» и файл не отдаёт.
+            p.op("PCHDDCapacity (место на ПК)", 0x911A, intArrayOf(0x7FFFFFFF, 0x1000, 1))
+            pump(200)
 
             // 3. спуск затвора. Камера отвечает на эту команду только когда снимок готов
             // (автофокус + выдержка), поэтому ждём долго, иначе ответ придёт позже и собьёт обмен
@@ -111,7 +115,10 @@ class PhotoCapture(
             // 5. скачиваем
             for (o in objs) {
                 val data = download(o)
-                if (o.transfer) p.transact(0x9117, intArrayOf(o.oid)) // TransferComplete: камера освобождает буфер
+                if (o.transfer) {
+                    p.transact(0x9117, intArrayOf(o.oid)) // TransferComplete: камера освобождает буфер
+                    p.transact(0x911A, intArrayOf(0x7FFFFFFF, 0x1000, 1))
+                }
                 if (data != null && data.isNotEmpty()) {
                     val n = if (o.name.isNotEmpty()) o.name else "IMG_%08X.JPG".format(o.oid)
                     files.add(PhotoFile(n, data))

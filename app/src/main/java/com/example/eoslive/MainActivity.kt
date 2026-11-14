@@ -2,6 +2,7 @@ package com.example.eoslive
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.ClipData
@@ -149,6 +150,15 @@ class MainActivity : Activity() {
     private var stackSec = 30.0
     private var stackMethod = StackMethod.SUM
     private var stackTargetSec = 30.0
+    /** Множитель яркости результата (0 = авто). */
+    private var stackGain = 1f
+    private val gainSteps = floatArrayOf(1f, 2f, 4f, 8f, 16f, 0f)
+    private lateinit var btnStackGain: Button
+    private lateinit var btnStackDark: Button
+    private var darkFrame: DarkFrame? = null
+    private var darkSig = ""
+    @Volatile private var darkLe: LongExposure? = null
+    @Volatile private var darkBusy = false
     @Volatile private var lastAspect = 0f
     @Volatile private var lastCrop = 0f
     private var tmpFile: File? = null
@@ -308,6 +318,16 @@ class MainActivity : Activity() {
             isEnabled = false
             setOnClickListener { onStackClick() }
         }
+        btnStackGain = Button(this).apply {
+            isAllCaps = false
+            textSize = 12f
+            setOnClickListener { onGainClick() }
+        }
+        btnStackDark = Button(this).apply {
+            isAllCaps = false
+            textSize = 12f
+            setOnClickListener { onDarkClick() }
+        }
         stackPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(LinearLayout(this@MainActivity).apply {
@@ -317,7 +337,12 @@ class MainActivity : Activity() {
                 addView(etStackSec, LinearLayout.LayoutParams(0, wrap, 0.7f))
                 addView(btnStackMethod, LinearLayout.LayoutParams(0, wrap, 1f))
             })
-            addView(btnStackGo)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(btnStackGo, LinearLayout.LayoutParams(0, wrap, 1.3f))
+                addView(btnStackGain, LinearLayout.LayoutParams(0, wrap, 1f))
+                addView(btnStackDark, LinearLayout.LayoutParams(0, wrap, 1f))
+            })
         }
 
         // картинка + кнопки поверх неё (запись и полный экран)
@@ -595,8 +620,8 @@ class MainActivity : Activity() {
         btnRec.isEnabled = live && !stackActive && !photoBusy
         btnShoot.text = if (photoBusy) "Снимаю…" else "📷 Снять"
         btnShoot.isEnabled = live && !photoBusy && !stackActive && !recording
-        btnStackGo.text = if (stackActive) "■ Стоп и сохранить" else "▶ Старт суммирования"
-        btnStackGo.isEnabled = live && !photoBusy && !recording
+        btnStackGo.text = if (stackActive) "■ Стоп" else "▶ Старт"
+        btnStackGo.isEnabled = live && !photoBusy && !recording && !darkBusy
         btnRecOv.text = when (mode) {
             Mode.VIDEO -> if (recording) "■" else "●"
             Mode.PHOTO -> if (photoBusy) "…" else "📷"
@@ -990,6 +1015,7 @@ class MainActivity : Activity() {
         val p = getSharedPreferences("stack_settings", Context.MODE_PRIVATE)
         stackTimed = p.getBoolean("timed", true)
         stackSec = p.getFloat("sec", 30f).toDouble()
+        stackGain = p.getFloat("gain", 1f)
         stackMethod = try { StackMethod.valueOf(p.getString("method", "SUM") ?: "SUM") } catch (_: Exception) { StackMethod.SUM }
     }
 
@@ -997,6 +1023,7 @@ class MainActivity : Activity() {
         getSharedPreferences("stack_settings", Context.MODE_PRIVATE).edit()
             .putBoolean("timed", stackTimed)
             .putFloat("sec", stackSec.toFloat())
+            .putFloat("gain", stackGain)
             .putString("method", stackMethod.name)
             .apply()
     }
@@ -1006,6 +1033,81 @@ class MainActivity : Activity() {
         etStackSec.visibility = if (stackTimed) View.VISIBLE else View.GONE
         etStackSec.isEnabled = !stackActive
         btnStackMethod.text = "Метод: " + stackMethod.label
+        btnStackGain.text = "Яркость: " + gainLabel(stackGain)
+        btnStackDark.text = "Тёмный: " + (if (darkBusy) "…" else if (darkFrame != null) "есть" else "нет")
+        btnStackDark.isEnabled = !stackActive && !darkBusy
+    }
+
+    private fun gainLabel(g: Float): String =
+        if (g <= 0f) "авто" else "×" + (if (g == Math.floor(g.toDouble()).toFloat()) g.toInt().toString() else g.toString())
+
+    /** Меняется и во время суммирования: результат в превью меняется сразу. */
+    private fun onGainClick() {
+        val i = gainSteps.indexOfFirst { it == stackGain }
+        stackGain = gainSteps[(i + 1) % gainSteps.size]
+        saveStackPrefs()
+        stack?.gain = stackGain
+        updateStackUi()
+    }
+
+    private fun camSig(): String = "${eos.value(EosProp.TV)}/${eos.value(EosProp.ISO)}/${eos.value(EosProp.AV)}"
+
+    private fun onDarkClick() {
+        if (stackActive || darkBusy) return
+        if (!running) { Toast.makeText(this, "Сначала Старт Live View", Toast.LENGTH_SHORT).show(); return }
+        val b = AlertDialog.Builder(this)
+            .setTitle("Тёмный кадр")
+            .setMessage("Убирает вертикальные полосы и «ткань» на длинной выдержке: матрица каждый раз даёт один и тот же рисунок, " +
+                "и его можно вычесть.\n\nЗакрой объектив крышкой. ISO, выдержка и диафрагма должны быть такими же, " +
+                "как при суммировании. Снимается около 3 секунд.")
+            .setPositiveButton("Снять") { _, _ -> startDark() }
+            .setNegativeButton("Отмена", null)
+        if (darkFrame != null) b.setNeutralButton("Удалить") { _, _ -> darkFrame = null; updateStackUi(); log("тёмный кадр удалён") }
+        b.show()
+    }
+
+    private fun startDark() {
+        if (!running || stackActive || darkBusy) return
+        darkBusy = true
+        darkSig = camSig()
+        val le = LongExposure(StackMethod.AVG, null, { log(it) }) { _ -> }
+        darkLe = le
+        le.start()
+        val t0 = System.nanoTime()
+        infoOv.visibility = View.VISIBLE
+        setRecUi()
+        ui.post(object : Runnable {
+            override fun run() {
+                val el = (System.nanoTime() - t0) / 1e9
+                infoOv.text = "Тёмный кадр: объектив закрыт? Осталось %.0f с, кадров %d".format(maxOf(0.0, 3.0 - el), le.frames)
+                if (el >= 3.0) finishDark(le) else ui.postDelayed(this, 150)
+            }
+        })
+    }
+
+    private fun finishDark(le: LongExposure) {
+        darkLe = null
+        infoOv.text = "Считаю тёмный кадр…"
+        Thread {
+            le.finish()
+            val m = le.darkMaster()
+            runOnUiThread {
+                darkBusy = false
+                if (!holdPreview) infoOv.visibility = View.GONE
+                if (m == null || le.frames < 5) {
+                    darkFrame = null
+                    log("тёмный кадр не снялся, кадров: ${le.frames}")
+                    toast("Тёмный кадр не снялся (кадров: ${le.frames})")
+                } else {
+                    darkFrame = m
+                    val lvl = m.meanLevel()
+                    log("тёмный кадр: ${le.frames} кадров, средний уровень %.1f из 255 (${darkSig})".format(lvl))
+                    toast(if (lvl > 30) "Уровень тёмного кадра высокий (%.0f из 255): объектив точно закрыт крышкой?".format(lvl)
+                          else "Тёмный кадр готов. Открой объектив")
+                }
+                setRecUi()
+            }
+        }.start()
     }
 
     private fun onStackClick() {
@@ -1020,15 +1122,21 @@ class MainActivity : Activity() {
         }
         saveStackPrefs()
         stackTargetSec = stackSec
-        val le = LongExposure(stackMethod, { log(it) }) { bmp ->
+        if (darkFrame != null && darkSig != camSig()) {
+            log("настройки камеры изменились после тёмного кадра (было $darkSig, стало ${camSig()})")
+            toast("Выдержка/ISO/диафрагма изменились после тёмного кадра: вычитание может быть неточным. Лучше снять тёмный кадр заново")
+        }
+        val le = LongExposure(stackMethod, darkFrame, { log(it) }) { bmp ->
             runOnUiThread { if (stackActive) zoomView.setFrame(bmp, lastAspect, lastCrop) }
         }
+        le.gain = stackGain
         stack = le
         le.start()
         stackT0 = System.nanoTime()
         holdPreview = true
         stackActive = true
         infoOv.text = "Суммирование…"
+        log("  яркость: ${gainLabel(stackGain)}, тёмный кадр: " + (if (darkFrame != null) "да" else "нет"))
         infoOv.visibility = View.VISIBLE
         log("суммирование: старт, метод «${stackMethod.label}», " + if (stackTimed) "по времени ${fmtDur(stackTargetSec)}" else "бесконечная (стоп вручную)")
         setRecUi()
@@ -1081,7 +1189,7 @@ class MainActivity : Activity() {
             val skipped = st.dropped + st.rejected
             val name = "eos_stack_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + "_" + Math.round(elapsed) + "s.jpg"
             val saved = Gallery.saveJpeg(this, res, name)
-            val line = "Готово: ${fmtDur(elapsed)}, кадров $n" + (if (skipped > 0) " (пропущено $skipped)" else "") + ", метод «$label»"
+            val line = "Готово: ${fmtDur(elapsed)}, кадров $n" + (if (skipped > 0) " (пропущено $skipped)" else "") + ", метод «$label»" + (if (st.darkUsed) ", с тёмным кадром" else "")
             log(line + " -> " + (saved ?: "не удалось сохранить"))
             runOnUiThread {
                 holdPreview = true
@@ -1149,6 +1257,7 @@ class MainActivity : Activity() {
         lastCrop = if (crop) X1_W.toFloat() / X1_H else 0f
         val st = stack
         if (stackActive && st != null) st.offer(jpg)
+        darkLe?.offer(jpg)
         if (recording && !isRecActive()) {
             startRecording(sz, crop)
         } else if (!recording && isRecActive()) {
